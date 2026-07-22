@@ -13,6 +13,7 @@ from .humanoid import *
 import trimesh
 
 from ...utils.path_utils import resolve_data_path
+from ...evaluation import select_evaluation_motion, validate_evaluation_report
 
 
 
@@ -384,10 +385,20 @@ class InterMimic(Humanoid_SMPLX):
         return
     
     def _reset_target(self, env_ids):
-        self._target_states[env_ids, :3] = self.extract_ref_component('obj_pos', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
-        self._target_states[env_ids, 3:7] = self.extract_ref_component('obj_rot', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
-        self._target_states[env_ids, 7:10] = self.extract_ref_component('obj_pos_vel', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
-        self._target_states[env_ids, 10:13] = self.extract_ref_component('obj_rot_vel', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
+        device = self._target_states.device
+        reference = {
+            name: self.extract_ref_component(
+                name,
+                self.data_id[env_ids],
+                self.ref_index[env_ids],
+                self.progress_buf[env_ids],
+            ).to(device)
+            for name in ("obj_pos", "obj_rot", "obj_pos_vel", "obj_rot_vel")
+        }
+        self._target_states[env_ids, :3] = reference["obj_pos"]
+        self._target_states[env_ids, 3:7] = reference["obj_rot"]
+        self._target_states[env_ids, 7:10] = reference["obj_pos_vel"]
+        self._target_states[env_ids, 10:13] = reference["obj_rot_vel"]
         return  
 
     def _reset_env_tensors(self, env_ids):
@@ -432,32 +443,22 @@ class InterMimic(Humanoid_SMPLX):
     def _reset_ref_state_init(self, env_ids):
         num_envs = env_ids.shape[0]
 
-        # During evaluation, prioritize undersampled sequences for balanced coverage
+        # Evaluation covers every object-compatible motion before repeating one.
         if self.enable_evaluation:
             i = []
             for env_idx in env_ids:
-                # Get valid motion indices for this object type
                 obj_type = env_idx % len(self.object_name)
                 valid_motions = torch.where(self.obj2motion[obj_type] == 1)[0]
-
-                # Get visit counts for valid motions
-                visit_counts = self._sequence_visit_count[valid_motions]
-
-                # Sample with inverse probability (prioritize less visited sequences)
-                # Add 1 to avoid division by zero
-                inv_counts = 1.0 / (visit_counts.float() + 1.0)
-                probs = inv_counts / inv_counts.sum()
-
-                # Sample based on inverse visit counts
-                sampled_idx = torch.multinomial(probs, 1).item()
-                selected_motion = valid_motions[sampled_idx]
+                selected_motion = select_evaluation_motion(
+                    valid_motions,
+                    self._max_execution_steps,
+                    self._sequence_visit_count,
+                )
                 i.append(selected_motion)
-
-            i = to_torch(i, device=self.device, dtype=torch.long)
-
-            # Update visit counts
-            for motion_id in i:
-                self._sequence_visit_count[motion_id] += 1
+                # Update immediately so environments reset in this batch do not
+                # all receive the same least-visited motion.
+                self._sequence_visit_count[selected_motion] += 1
+            i = torch.stack(i).to(device=self.device, dtype=torch.long)
         else:
             # Original random sampling for training
             i = to_torch([torch.where(self.obj2motion[i % len(self.object_name)] == 1)[0][torch.randint(self.obj2motion[i % len(self.object_name)].sum(), ())] for i in env_ids], device=self.device, dtype=torch.long)
@@ -530,6 +531,12 @@ class InterMimic(Humanoid_SMPLX):
         return
 
     def _set_env_state(self, env_ids, root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel):
+        device = self._humanoid_root_states.device
+        env_ids = env_ids.to(device)
+        root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel = (
+            value.to(device)
+            for value in (root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel)
+        )
         self._humanoid_root_states[env_ids, 0:3] = root_pos
         self._humanoid_root_states[env_ids, 3:7] = root_rot
         self._humanoid_root_states[env_ids, 7:10] = root_vel
@@ -794,13 +801,13 @@ class InterMimic(Humanoid_SMPLX):
                 # Since stateInit is "Start", we average from 1 to curr_steps (skip index 0 which is never computed)
                 if self._max_execution_steps[seq_id] < curr_steps:
                     self._max_execution_steps[seq_id] = curr_steps
-                    # Average from index 1 onwards (index 0 is the initial state, no reward computed)
-                    self._best_human_pose_error_per_seq[seq_id] = self._human_pose_error_per_seq_step[seq_id, 1:curr_steps].mean()
-                    self._best_object_pose_error_per_seq[seq_id] = self._object_pose_error_per_seq_step[seq_id, 1:curr_steps].mean()
+                    # Include the terminal step; index 0 is the unscored initial state.
+                    self._best_human_pose_error_per_seq[seq_id] = self._human_pose_error_per_seq_step[seq_id, 1:curr_steps + 1].mean()
+                    self._best_object_pose_error_per_seq[seq_id] = self._object_pose_error_per_seq_step[seq_id, 1:curr_steps + 1].mean()
                     flag = True
                 elif self._max_execution_steps[seq_id] == curr_steps:
-                    curr_human_error = self._human_pose_error_per_seq_step[seq_id, 1:curr_steps].mean()
-                    curr_object_error = self._object_pose_error_per_seq_step[seq_id, 1:curr_steps].mean()
+                    curr_human_error = self._human_pose_error_per_seq_step[seq_id, 1:curr_steps + 1].mean()
+                    curr_object_error = self._object_pose_error_per_seq_step[seq_id, 1:curr_steps + 1].mean()
                     if self._best_human_pose_error_per_seq[seq_id] + self._best_object_pose_error_per_seq[seq_id] > curr_human_error + curr_object_error:
                         self._best_human_pose_error_per_seq[seq_id] = curr_human_error
                         self._best_object_pose_error_per_seq[seq_id] = curr_object_error
@@ -1205,42 +1212,88 @@ class InterMimic(Humanoid_SMPLX):
                 self.gym.write_viewer_image_to_file(self.viewer, str(rgb_filename))
         return
 
-    def print_final_eval_summary(self):
-        """Print final evaluation summary at the end of inference"""
+    def evaluation_complete(self):
+        """Return whether every native evaluation motion has produced a result."""
+
+        return self.enable_evaluation and bool((self._max_execution_steps >= 1).all().item())
+
+    def evaluation_report(self):
+        """Return the complete native evaluation result in natural groups."""
+
         if not self.enable_evaluation:
-            return
-
+            raise RuntimeError("InterMimic evaluation is not enabled")
         evaluated_mask = self._max_execution_steps >= 1
-        num_evaluated = evaluated_mask.sum()
+        evaluated_count = int(evaluated_mask.sum().item())
+        success_mask = evaluated_mask & (
+            self._max_execution_steps >= self.max_episode_length - 1
+        )
+        success_count = int(success_mask.sum().item())
 
-        if num_evaluated == 0:
-            print("=" * 60)
-            print("WARNING: No sequences were evaluated!")
-            print("Consider increasing --max_steps in the evaluation script")
-            print("=" * 60)
-            return
+        if evaluated_count:
+            average_execution_steps = float(
+                self._max_execution_steps[evaluated_mask].float().mean().item()
+            )
+            average_human_error = float(
+                self._best_human_pose_error_per_seq[evaluated_mask].mean().item()
+            )
+            average_object_error = float(
+                self._best_object_pose_error_per_seq[evaluated_mask].mean().item()
+            )
+        else:
+            average_execution_steps = None
+            average_human_error = None
+            average_object_error = None
 
-        avg_execution_steps = self._max_execution_steps[evaluated_mask].float().mean()
-        avg_human_error = self._best_human_pose_error_per_seq[evaluated_mask].mean()
-        avg_object_error = self._best_object_pose_error_per_seq[evaluated_mask].mean()
-        success_count = torch.sum(self._max_execution_steps[evaluated_mask] - (self.max_episode_length[evaluated_mask] - 1) >= 0)
-        success_rate = success_count.float() / num_evaluated
+        motions = []
+        for motion_id in range(self.num_motions):
+            evaluated = bool(evaluated_mask[motion_id].item())
+            object_id = int(self.object_id[motion_id].item())
+            motions.append(
+                {
+                    "motion_id": motion_id,
+                    "motion_file": self.motion_file[motion_id],
+                    "dataset_id": int(self.dataset_index[motion_id].item()),
+                    "object": self.object_name[object_id],
+                    "visits": int(self._sequence_visit_count[motion_id].item()),
+                    "evaluated": evaluated,
+                    "execution_steps": int(self._max_execution_steps[motion_id].item()),
+                    "success": bool(success_mask[motion_id].item()),
+                    "human_pose_error": float(
+                        self._best_human_pose_error_per_seq[motion_id].item()
+                    ) if evaluated else None,
+                    "object_pose_error": float(
+                        self._best_object_pose_error_per_seq[motion_id].item()
+                    ) if evaluated else None,
+                }
+            )
 
-        # Visit statistics
-        min_visits = self._sequence_visit_count.min().item()
-        max_visits = self._sequence_visit_count.max().item()
-        avg_visits = self._sequence_visit_count.float().mean().item()
+        missing_motion_ids = [
+            motion["motion_id"] for motion in motions if not motion["evaluated"]
+        ]
+        report = {
+            "coverage": {
+                "total": self.num_motions,
+                "evaluated": evaluated_count,
+                "missing_motion_ids": missing_motion_ids,
+                "complete": not missing_motion_ids,
+            },
+            "success": {
+                "count": success_count,
+                "denominator": self.num_motions,
+                "rate": success_count / self.num_motions,
+            },
+            "metrics": {
+                "aggregation": "evaluated_only",
+                "evaluated_count": evaluated_count,
+                "average_execution_steps": average_execution_steps,
+                "average_human_pose_error": average_human_error,
+                "average_object_pose_error": average_object_error,
+            },
+            "motions": motions,
+        }
+        validate_evaluation_report(report)
+        return report
 
-        print("\n" + "=" * 60)
-        print("FINAL EVALUATION SUMMARY:")
-        print(f"  Sequences Evaluated: {num_evaluated}/{self.num_motions} ({100.0 * num_evaluated / self.num_motions:.1f}%)")
-        print(f"  Sequence Visits - Min: {min_visits}, Max: {max_visits}, Avg: {avg_visits:.1f}")
-        print(f"  Average Execution Steps: {avg_execution_steps:.2f}")
-        print(f"  Average Human Pose Error: {avg_human_error:.4f}")
-        print(f"  Average Object Pose Error: {avg_object_error:.4f}")
-        print(f"  Success Rate: {success_rate:.2%} ({success_count}/{num_evaluated})")
-        print("=" * 60 + "\n")
-    
 @torch.jit.script
 def compute_sdf(points1, points2):
     # type: (Tensor, Tensor) -> Tensor
