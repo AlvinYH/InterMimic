@@ -84,7 +84,7 @@ def create_rlgpu_env(**kwargs):
     # bind this process to its GPU
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
-        args.device = 'cuda'
+        args.device = args.sim_device_type if args.use_gpu_pipeline else 'cpu'
         args.device_id = local_rank
         args.rl_device = f'cuda:{local_rank}'
         cfg['rank'] = rank

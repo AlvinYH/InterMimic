@@ -68,6 +68,8 @@ class InterMimicAgent(common_agent.CommonAgent):
         if self._normalize_input:
             self._input_mean_std = RunningMeanStd(self._amp_observation_space.shape).to(self.ppo_device)
         self.resume_from = config['resume_from']
+        self.policy_init_from = config['policy_init_from']
+        self.schedule_start_epoch = config['schedule_start_epoch']
         self.done_indices = []
         self.epoch_num_start = 0
         return
@@ -163,10 +165,12 @@ class InterMimicAgent(common_agent.CommonAgent):
     
     def train(self):
         if self.resume_from != 'None':
-            try:
-                self.restore(self.resume_from)
-            except:
-                print('Failed to restore from checkpoint')
+            self.restore(self.resume_from)
+        else:
+            if self.policy_init_from != 'None':
+                self.initialize_policy(self.policy_init_from)
+            self.epoch_num = self.schedule_start_epoch
+            self.epoch_num_start = self.schedule_start_epoch
 
         self.init_tensors()
         self.last_mean_rewards = -100500
@@ -273,6 +277,62 @@ class InterMimicAgent(common_agent.CommonAgent):
             if should_exit:
                 return self.last_mean_rewards, epoch_num
         # not reached
+        return
+
+    def initialize_policy(self, fn):
+        """Initialize model statistics without restoring optimizer or run state."""
+
+        checkpoint = torch_ext.load_checkpoint(fn)
+        current = self.model.state_dict()
+        source = checkpoint['model']
+        expanded = {}
+        input_layers = {
+            'a2c_network.actor_mlp.0.weight',
+            'a2c_network.critic_mlp.0.weight',
+        }
+        for name, target in current.items():
+            value = source[name].to(device=target.device, dtype=target.dtype)
+            if value.shape == target.shape:
+                expanded[name] = value
+            elif (
+                name in input_layers
+                and value.ndim == 2
+                and target.ndim == 2
+                and value.shape[0] == target.shape[0]
+                and value.shape[1] < target.shape[1]
+            ):
+                initialized = torch.zeros_like(target)
+                initialized[:, :value.shape[1]] = value
+                expanded[name] = initialized
+            else:
+                raise ValueError(
+                    f'Policy init shape mismatch for {name}: {tuple(value.shape)} vs '
+                    f'{tuple(target.shape)}'
+                )
+        self.model.load_state_dict(expanded)
+
+        if self.normalize_input:
+            current_stats = self.running_mean_std.state_dict()
+            source_stats = checkpoint['running_mean_std']
+            initialized_stats = {}
+            for name, target in current_stats.items():
+                value = source_stats[name].to(device=target.device, dtype=target.dtype)
+                if value.shape == target.shape:
+                    initialized_stats[name] = value
+                elif name in {'running_mean', 'running_var'} and value.numel() < target.numel():
+                    initialized = torch.zeros_like(target)
+                    if name == 'running_var':
+                        initialized.fill_(1.0)
+                    initialized[:value.numel()] = value.reshape(-1)
+                    initialized_stats[name] = initialized
+                else:
+                    raise ValueError(
+                        f'Observation statistics shape mismatch for {name}: '
+                        f'{tuple(value.shape)} vs {tuple(target.shape)}'
+                    )
+            self.running_mean_std.load_state_dict(initialized_stats)
+        if self._normalize_input:
+            self._input_mean_std.load_state_dict(checkpoint['amp_input_mean_std'])
         return
 
     def init_tensors(self):

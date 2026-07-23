@@ -886,8 +886,14 @@ class InterMimic(Humanoid_SMPLX):
                                                         max_episode_length, enable_early_termination, termination_heights, 
                                                         start_times, rollout_length)
 
-        reset_ig *= (progress_buf > 1 + start_times)
-        contact_reset *= (progress_buf > 1 + start_times)
+        grace_steps = (
+            1
+            if self._termination_grace_steps is None
+            else self._termination_grace_steps
+        )
+        past_grace = progress_buf > grace_steps + start_times
+        reset_ig *= past_grace
+        contact_reset *= past_grace
                 
         terminated = torch.where(torch.logical_or(reset_ig, contact_reset), torch.ones_like(reset_buf), terminated)
         reset = torch.where(reset.bool(), torch.ones_like(reset_buf), terminated)
