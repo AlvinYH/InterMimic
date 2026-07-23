@@ -499,11 +499,10 @@ class Humanoid_SMPLX(BaseTask):
             has_failed *= progress_buf > 1
         else:
             has_failed *= progress_buf > self._termination_grace_steps + start_times
-        invalid_obs = ~torch.isfinite(obs_buf)  # True where obs is NaN or infinite
-        invalid_batches = torch.any(invalid_obs, dim=1)  # Check if any invalid number in each batch (B, N)
-        if torch.any(invalid_obs):
-            print("invalid observation")
-            raise Exception("invalid observation")
+        invalid_batches = ~torch.isfinite(obs_buf).all(dim=1)
+        torch._assert_async(
+            ~invalid_batches.any(), "invalid observation"
+        )
             
         terminated = torch.where(torch.logical_or(invalid_batches, has_failed), torch.ones_like(reset_buf), terminated)
         reset = torch.where(torch.logical_or(progress_buf >= max_episode_length-1, progress_buf - start_times >= rollout_length-1), torch.ones_like(reset_buf), terminated)

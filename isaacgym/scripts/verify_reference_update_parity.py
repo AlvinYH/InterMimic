@@ -122,6 +122,8 @@ def _task(seed: int):
         contact_reset=torch.zeros((envs, 1), device=device),
         enable_evaluation=False,
         psi=4,
+        _reference_update_possible=True,
+        _all_env_ids=torch.arange(envs, device=device),
         _sum_reward=torch.rand(
             envs, generator=generator, device=device
         ),
@@ -165,6 +167,66 @@ def _clone(task):
     return clone
 
 
+def _check_single_motion_sampling() -> None:
+    env_ids = torch.arange(257, device="cuda")
+    obj2motion = torch.ones((1, 1), dtype=torch.bool, device="cuda")
+    task = SimpleNamespace(
+        num_motions=1,
+        device="cuda",
+        object_name=["object"],
+        obj2motion=obj2motion,
+        _single_motion_fixed_start=True,
+    )
+    for seed in range(4):
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        old_ids = torch.stack(
+            [
+                torch.where(obj2motion[0])[0][
+                    torch.randint(obj2motion[0].sum(), ())
+                ]
+                for _ in env_ids
+            ]
+        ).to("cuda")
+        old_mask = torch.bernoulli(
+            torch.full((len(env_ids),), 0.1, device="cuda")
+        ).bool()
+        reset_ids = env_ids[old_mask]
+        old_times = torch.cat(
+            [
+                torch.searchsorted(
+                    torch.ones(1, device="cuda"),
+                    torch.rand(1).to("cuda"),
+                )
+                if env_id not in reset_ids
+                else torch.zeros(1, device="cuda", dtype=torch.long)
+                for env_id in env_ids
+            ]
+        )
+        old_cpu_state = torch.get_rng_state()
+        old_cuda_state = torch.cuda.get_rng_state()
+
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        new_ids = InterMimic._sample_motion_ids(task, env_ids)
+        new_mask = torch.bernoulli(
+            torch.full((len(env_ids),), 0.1, device="cuda")
+        ).bool()
+        new_times = InterMimic._sample_hybrid_motion_times(
+            task, new_ids, env_ids, new_mask
+        )
+        if not torch.equal(old_ids, new_ids):
+            raise AssertionError("single-motion IDs changed")
+        if not torch.equal(old_mask, new_mask):
+            raise AssertionError("hybrid mask changed")
+        if not torch.equal(old_times, new_times):
+            raise AssertionError("fixed-start samples changed")
+        if not torch.equal(old_cpu_state, torch.get_rng_state()):
+            raise AssertionError("CPU RNG state changed")
+        if not torch.equal(old_cuda_state, torch.cuda.get_rng_state()):
+            raise AssertionError("CUDA RNG state changed")
+
+
 def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -184,6 +246,22 @@ def main() -> None:
         ):
             if not torch.equal(getattr(old, name), getattr(new, name)):
                 raise AssertionError(f"{name} mismatch at seed {seed}")
+    source = _task(100)
+    source.max_episode_length[:] = source.rollout_length
+    source._reference_update_possible = False
+    old = _clone(source)
+    new = _clone(source)
+    _old_update(old)
+    InterMimic._compute_reset(new)
+    for name in (
+        "_sum_reward",
+        "_curr_reward",
+        "ref_reward",
+        "hoi_refs",
+    ):
+        if not torch.equal(getattr(old, name), getattr(new, name)):
+            raise AssertionError(f"{name} no-update fast-path mismatch")
+    _check_single_motion_sampling()
     points1 = torch.randn((5, 17, 3), device="cuda")
     points2 = torch.randn((5, 11, 3), device="cuda")
     points2[:, 1] = points2[:, 0]
@@ -216,6 +294,8 @@ def main() -> None:
         if not torch.equal(old_curr, new_curr):
             raise AssertionError(f"current buffer mismatch at step {step}")
     print("InterMimic reference update: exact CUDA tensor parity")
+    print("InterMimic no-update fast path: exact CUDA tensor parity")
+    print("InterMimic single-motion sampling: exact RNG/tensor parity")
     print("InterMimic SDF/history buffers: exact CUDA tensor parity")
 
 

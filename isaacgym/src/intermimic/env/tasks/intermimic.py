@@ -71,6 +71,13 @@ class InterMimic(Humanoid_SMPLX):
                          headless=headless)
         
         self.hoi_data = self._load_motion(self.motion_file, topk=self.psi)
+        self._reference_update_possible = bool(
+            torch.any(self.max_episode_length > self.rollout_length).item()
+        )
+        self._single_motion_fixed_start = (
+            self.num_motions == 1
+            and int(self.max_episode_length[0].item()) - self.rollout_length <= 1
+        )
 
         self._curr_ref_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
         self._curr_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
@@ -243,53 +250,39 @@ class InterMimic(Humanoid_SMPLX):
             'obj_pos', 'obj_rot', 'obj_pos_vel', 'obj_rot_vel', 'ig', 'contact_human', 'contact_obj'
         ]
 
-        # Precompute the sizes for each component.
-        data_component_sizes = [
-            loaded_dict[name].shape[1]
-            for name in self.data_component_order
-        ]
-
-        # Precompute cumulative indices. The first index is zero.
-        # For each i, calculate the sum of component_sizes[:i] to determine the starting index for that component.
-        self.data_component_index = [sum(data_component_sizes[:i]) for i in range(len(data_component_sizes) + 1)]
+        start = 0
+        self.data_component_slices = {}
+        for name in self.data_component_order:
+            end = start + loaded_dict[name].shape[1]
+            self.data_component_slices[name] = slice(start, end)
+            start = end
 
         self.ref_component_order = [
             'root_pos', 'root_rot', 'root_pos_vel', 'root_rot_vel', 'dof_pos', 'dof_vel', 'obj_pos', 'obj_rot', 
             'obj_pos_vel', 'obj_rot_vel'
         ]
 
-        # Precompute the sizes for each component.
-        ref_component_sizes = [
-            loaded_dict[name].shape[1]
-            for name in self.ref_component_order
-        ]
-
-        # Precompute cumulative indices. The first index is zero.
-        # For each i, calculate the sum of component_sizes[:i] to determine the starting index for that component.
-        self.ref_component_index = [sum(ref_component_sizes[:i]) for i in range(len(ref_component_sizes) + 1)]
+        start = 0
+        self.ref_component_slices = {}
+        for name in self.ref_component_order:
+            end = start + loaded_dict[name].shape[1]
+            self.ref_component_slices[name] = slice(start, end)
+            start = end
 
     def extract_ref_component(self, var_name, data_id, ref_index, t):
-        index = self.ref_component_order.index(var_name)
-        
-        # The number of columns to extract for this component.
-        start = self.ref_component_index[index]
-        end = self.ref_component_index[index+1]
-        
-        return self.hoi_refs[data_id, ref_index, t, start:end]
+        return self.hoi_refs[
+            data_id, ref_index, t, self.ref_component_slices[var_name]
+        ]
 
 
     def extract_data_component(self, var_name, ref=False, data_id=None, t=None, obs=None):
-        index = self.data_component_order.index(var_name)
-        
-        # The number of columns to extract for this component.
-        start = self.data_component_index[index]
-        end = self.data_component_index[index+1]
-        
         if ref and data_id is not None and t is not None:
-            return self.hoi_data[data_id, t, start:end]
+            return self.hoi_data[
+                data_id, t, self.data_component_slices[var_name]
+            ]
         
         if obs is not None:
-            return obs[..., start:end]
+            return obs[..., self.data_component_slices[var_name]]
 
     def _create_envs(self, num_envs, spacing, num_per_row):
 
@@ -460,7 +453,7 @@ class InterMimic(Humanoid_SMPLX):
             i = torch.stack(i).to(device=self.device, dtype=torch.long)
         else:
             # Original random sampling for training
-            i = to_torch([torch.where(self.obj2motion[i % len(self.object_name)] == 1)[0][torch.randint(self.obj2motion[i % len(self.object_name)].sum(), ())] for i in env_ids], device=self.device, dtype=torch.long)
+            i = self._sample_motion_ids(env_ids)
 
         if (self._state_init == InterMimic.StateInit.Random
             or self._state_init == InterMimic.StateInit.Hybrid):
@@ -500,13 +493,12 @@ class InterMimic(Humanoid_SMPLX):
 
     def _reset_hybrid_state_init(self, env_ids):
         num_envs = env_ids.shape[0]
-        i = to_torch([torch.where(self.obj2motion[i % len(self.object_name)] == 1)[0][torch.randint(self.obj2motion[i % len(self.object_name)].sum(), ())] for i in env_ids], device=self.device, dtype=torch.long)
+        i = self._sample_motion_ids(env_ids)
         ref_probs = to_torch(np.array([self._hybrid_init_prob] * num_envs), device=self.device)
         ref_init_mask = torch.bernoulli(ref_probs) == 1.0
-
-        ref_reset_ids = env_ids[ref_init_mask]
-
-        motion_times = torch.cat([torch.searchsorted(self.cal_cdf(i, e), torch.rand(1).to(self.device)) if env_ids[e] not in ref_reset_ids else torch.zeros((1,), device=self.device, dtype=torch.long) for e in range(num_envs)]) 
+        motion_times = self._sample_hybrid_motion_times(
+            i, env_ids, ref_init_mask
+        )
         ref_reward = self.ref_reward[i, :, motion_times] 
         prob = ref_reward / ref_reward.sum(1, keepdim=True)
 
@@ -528,6 +520,51 @@ class InterMimic(Humanoid_SMPLX):
                             dof_vel=self.extract_ref_component('dof_vel', i, idx, motion_times),
                             )
         return
+
+    def _sample_motion_ids(self, env_ids):
+        if self.num_motions == 1:
+            # Preserve the upstream CPU RNG stream while avoiding one GPU scalar
+            # synchronization per environment.
+            torch.randint(1, (env_ids.shape[0],))
+            return torch.zeros_like(env_ids, device=self.device)
+        return to_torch(
+            [
+                torch.where(
+                    self.obj2motion[env_id % len(self.object_name)] == 1
+                )[0][
+                    torch.randint(
+                        self.obj2motion[
+                            env_id % len(self.object_name)
+                        ].sum(),
+                        (),
+                    )
+                ]
+                for env_id in env_ids
+            ],
+            device=self.device,
+            dtype=torch.long,
+        )
+
+    def _sample_hybrid_motion_times(self, motion_ids, env_ids, ref_init_mask):
+        if self._single_motion_fixed_start:
+            # Upstream draws one CPU uniform for every non-reference reset.
+            # A batched draw advances the CPU RNG by exactly the same amount.
+            torch.rand(int((~ref_init_mask).sum().item()))
+            return torch.zeros_like(env_ids, device=self.device)
+        ref_reset_ids = env_ids[ref_init_mask]
+        return torch.cat(
+            [
+                torch.searchsorted(
+                    self.cal_cdf(motion_ids, row),
+                    torch.rand(1).to(self.device),
+                )
+                if env_ids[row] not in ref_reset_ids
+                else torch.zeros(
+                    (1,), device=self.device, dtype=torch.long
+                )
+                for row in range(env_ids.shape[0])
+            ]
+        )
 
     def _set_env_state(self, env_ids, root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel):
         device = self._humanoid_root_states.device
@@ -827,7 +864,11 @@ class InterMimic(Humanoid_SMPLX):
                 print(f'  Success Rate: {success_rate:.2%} ({success_count}/{self.max_episode_length.shape[0]})')
                 print('=' * 60)
 
-        if self.reset_buf.sum() > 0 and self.psi > 1:
+        if self.psi > 1 and not self._reference_update_possible:
+            self._sum_reward[self.reset_buf == 1] = 0
+            return
+
+        if self.psi > 1 and self.reset_buf.sum() > 0:
             reset_ind = (self.reset_buf == 1)
             data_id = self.data_id[reset_ind]
             max_episode_length = self.max_episode_length[data_id]
@@ -925,7 +966,7 @@ class InterMimic(Humanoid_SMPLX):
         kinematic_reset = torch.logical_or(human_reset, object_reset)
         self.contact_reset = (self.contact_reset + contact_reset) * contact_reset
         self.kinematic_reset = torch.logical_or(ig_reset, kinematic_reset)
-        index = torch.arange(self._curr_reward.shape[0])
+        index = self._all_env_ids
         # # print(self._humanoid_root_states.dtype)
         self._curr_reward[index, self.progress_buf - self.start_times] = self.rew_buf
         self._sum_reward[index] += self.rew_buf

@@ -208,8 +208,12 @@ class InterMimicArticulated(InterMimic):
         self._rollout_terminated = None
         self._last_env0_reset_qpos = None
         self._q_reference = None
+        self._initial_qpos = None
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
         self._q_reference = torch.as_tensor(self._q_reference_np, device=self.device)
+        self._initial_qpos = torch.as_tensor(
+            self._initial_qpos_np, device=self.device
+        )
         self._link_reference = torch.as_tensor(self._link_reference_np, device=self.device)
         self._link_reference_rot = torch.as_tensor(
             self._link_reference_rot_np, device=self.device
@@ -310,7 +314,9 @@ class InterMimicArticulated(InterMimic):
 
     def _reset_target(self, env_ids):
         super()._reset_target(env_ids)
-        q0 = to_torch(self._initial_qpos_np, device=self.device)
+        q0 = self._initial_qpos
+        if q0 is None:
+            q0 = to_torch(self._initial_qpos_np, device=self.device)
         if self._q_reference is None:
             reset_qpos = q0.expand(env_ids.shape[0], -1)
         else:
@@ -530,20 +536,10 @@ class InterMimicArticulated(InterMimic):
 
         # Keep the native non-hand contact and total-contact energy terms. Hand
         # references are deliberately absent here because their only GT is hand2.
-        hand_body_ids = {
-            body_id
-            for body_group in self._human_contact_body_groups
-            for body_id in body_group
-        }
-        other_ids = [
-            body_id
-            for body_id in range(len(self.contact_bodies))
-            if body_id not in hand_body_ids
-        ]
         ref_other_contact = self.extract_data_component(
             "contact_human", obs=self._curr_ref_obs
-        )[:, other_ids]
-        other_contact = human_contact[:, other_ids]
+        )[:, self._human_other_contact_body_ids]
+        other_contact = human_contact[:, self._human_other_contact_body_ids]
         other_error = (
             torch.abs(other_contact - ref_other_contact)
             * (ref_other_contact > contact_threshold)
@@ -585,6 +581,12 @@ class InterMimicArticulated(InterMimic):
         self._human_contact_body_groups = hand2_body_groups(human_names)
         flat_body_ids = tuple(
             body_id for group in self._human_contact_body_groups for body_id in group
+        )
+        hand_body_ids = set(flat_body_ids)
+        self._human_other_contact_body_ids = tuple(
+            body_id
+            for body_id in range(len(self.contact_bodies))
+            if body_id not in hand_body_ids
         )
         capsules = load_mjcf_body_capsules(
             self._humanoid_mjcf_path,
