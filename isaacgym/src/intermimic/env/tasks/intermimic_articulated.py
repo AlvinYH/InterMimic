@@ -238,6 +238,8 @@ class InterMimicArticulated(InterMimic):
     def _load_target_asset(self):
         urdf_path = Path(self._object_config["urdf_path"]).expanduser().resolve()
         options = gymapi.AssetOptions()
+        options.fix_base_link = True
+        options.disable_gravity = True
         options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
         options.vhacd_enabled = self._object_config["isaac_vhacd_enabled"]
         asset = self.gym.load_asset(self.sim, str(urdf_path.parent), urdf_path.name, options)
@@ -730,20 +732,34 @@ class InterMimicArticulated(InterMimic):
             return
         distance, hand_force, region_force = self._measure_contacts()
         frame = int(self._reference_frame()[0].item())
-        self._rollout.append({
-            "human_root_state": self._humanoid_root_states[0].detach().cpu().numpy(),
-            "human_dof_pos": self._dof_pos[0].detach().cpu().numpy(),
-            "human_body_state": self._rigid_body_state.view(self.num_envs, -1, 13)[0, :self.num_bodies].detach().cpu().numpy(),
-            "object_root_state": self._target_states[0].detach().cpu().numpy(),
-            "object_joint_qpos": self._target_dof_pos[0].detach().cpu().numpy(),
-            "object_joint_qpos_reference": self._q_reference[frame].detach().cpu().numpy(),
-            "object_link_state": self._target_body_state[0].detach().cpu().numpy(),
-            "region_distance_m": distance[0].detach().cpu().numpy(),
-            "intended": self._intended_contact[frame].detach().cpu().numpy(),
-            "hand_force_n": hand_force[0].detach().cpu().numpy(),
-            "region_force_n": region_force[0].detach().cpu().numpy(),
-            "terminated": bool(self._terminate_buf[0].item()),
-        })
+        physics_rollout = {
+            "human": {
+                "human_root_state": self._humanoid_root_states[0].detach().cpu().numpy(),
+                "human_dof_pos": self._dof_pos[0].detach().cpu().numpy(),
+                "human_body_state": self._rigid_body_state.view(
+                    self.num_envs, -1, 13
+                )[0, :self.num_bodies].detach().cpu().numpy(),
+            },
+            "object": {
+                "object_root_state": self._target_states[0].detach().cpu().numpy(),
+                "object_joint_qpos": self._target_dof_pos[0].detach().cpu().numpy(),
+                "object_joint_qpos_reference": self._q_reference[
+                    frame
+                ].detach().cpu().numpy(),
+                "object_link_state": self._target_body_state[0].detach().cpu().numpy(),
+            },
+            "contact": {
+                "region_distance_m": distance[0].detach().cpu().numpy(),
+                "intended": self._intended_contact[frame].detach().cpu().numpy(),
+                "hand_force_n": hand_force[0].detach().cpu().numpy(),
+                "region_force_n": region_force[0].detach().cpu().numpy(),
+            },
+            "policy": {
+                "terminated": bool(self._terminate_buf[0].item()),
+            },
+        }
+        self.extras["physics_rollout"] = physics_rollout
+        self._rollout.append(physics_rollout)
         done = bool(self.reset_buf[0].item()) or frame >= self._q_reference.shape[0] - 1
         if done:
             self._write_articulated_rollout()
@@ -755,8 +771,11 @@ class InterMimicArticulated(InterMimic):
             raise RuntimeError("Rollout finished before environment 0 recorded its object reset qpos")
         path = Path(self._rollout_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
-        keys = self._rollout[0].keys()
-        payload = {key: np.stack([frame[key] for frame in self._rollout]) for key in keys}
+        payload = {
+            key: np.stack([frame[group][key] for frame in self._rollout])
+            for group, fields in self._rollout[0].items()
+            for key in fields
+        }
         valid_frames = len(self._rollout)
         total_frames = self._q_reference.shape[0] - 1
         if valid_frames > total_frames:
