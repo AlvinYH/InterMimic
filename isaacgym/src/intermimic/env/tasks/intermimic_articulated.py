@@ -333,18 +333,22 @@ class InterMimicArticulated(InterMimic):
         self._target_dof_vel[env_ids] = 0.0
         if self._rollout_terminated is not None:
             self._rollout_terminated[env_ids] = False
-        if self._rollout_path and torch.any(env_ids == 0):
+        if self._rollout_path and len(env_ids) and torch.any(env_ids == 0):
             self._last_env0_reset_qpos = self._target_dof_pos[0].detach().cpu().numpy().copy()
 
     def _reset_env_tensors(self, env_ids):
-        super()._reset_env_tensors(env_ids)
-        actor_ids = self._tar_actor_ids[env_ids]
+        human_ids = self._humanoid_actor_ids[env_ids]
+        object_ids = self._tar_actor_ids[env_ids]
+        actor_ids = torch.stack((human_ids, object_ids), dim=1).reshape(-1).contiguous()
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim, gymtorch.unwrap_tensor(self._root_states), gymtorch.unwrap_tensor(actor_ids), len(actor_ids)
         )
+        dof_actor_ids = actor_ids if self._object_dof_count else human_ids
         self.gym.set_dof_state_tensor_indexed(
-            self.sim, gymtorch.unwrap_tensor(self._dof_state), gymtorch.unwrap_tensor(actor_ids), len(actor_ids)
+            self.sim, gymtorch.unwrap_tensor(self._dof_state), gymtorch.unwrap_tensor(dof_actor_ids), len(dof_actor_ids)
         )
+        self.reset_buf[env_ids] = 0
+        self._terminate_buf[env_ids] = 0
 
     def pre_physics_step(self, actions):
         self.actions = actions.to(self.device).clone()
