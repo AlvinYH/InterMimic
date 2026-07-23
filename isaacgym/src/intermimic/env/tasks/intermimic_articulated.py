@@ -19,10 +19,7 @@ from pipeline.physics.mimic.collision_distance import (
     load_mjcf_body_boxes,
     load_mjcf_body_capsules,
 )
-from pipeline.physics.mimic.contact_pairs import (
-    aggregate_rigid_contact_groups,
-    hand2_body_groups,
-)
+from pipeline.physics.mimic.contact_pairs import hand2_body_groups
 
 
 _ARTICULATED_OBJECT_COLLISION_FILTER = 2
@@ -161,10 +158,6 @@ class InterMimicArticulated(InterMimic):
         self._rollout_fps = float(env["dataFPS"])
         if self._rollout_fps <= 0.0:
             raise ValueError("dataFPS must be positive")
-        if self._rollout_path and bool(sim_params.use_gpu_pipeline):
-            raise RuntimeError(
-                "Exact articulated rollout contact requires --pipeline cpu"
-            )
         self._humanoid_mjcf_path = Path(
             env["articulatedHumanoidXmlPath"]
         ).expanduser().resolve()
@@ -649,32 +642,9 @@ class InterMimicArticulated(InterMimic):
             i for i, name in enumerate(self._target_asset_body_names)
             if not region_names or name in region_names
         ]
-        env = self.envs[0]
-        self._human_contact_env_body_groups = tuple(
-            tuple(
-                int(
-                    self.gym.get_actor_rigid_body_index(
-                        env,
-                        self.humanoid_handles[0],
-                        body_id,
-                        gymapi.DOMAIN_ENV,
-                    )
-                )
-                for body_id in group
-            )
-            for group in self._human_contact_body_groups
+        self._target_contact_body_ids = torch.as_tensor(
+            target_local, device=self.device, dtype=torch.long
         )
-        self._target_contact_env_body_ids = [
-            int(
-                self.gym.get_actor_rigid_body_index(
-                    env,
-                    self._target_handles[0],
-                    body_id,
-                    gymapi.DOMAIN_ENV,
-                )
-            )
-            for body_id in target_local
-        ]
 
         missing_point_links = [
             name for name in self._contact_point_link_names if name not in body_lookup
@@ -740,19 +710,23 @@ class InterMimicArticulated(InterMimic):
             for label, group in enumerate(self._human_contact_group_slices):
                 distance[:, label] = body_distance[:, group].min(dim=1).values
 
-        exact = aggregate_rigid_contact_groups(
-            self.gym.get_env_rigid_contacts(self.envs[0]),
-            humanoid_body_groups=self._human_contact_env_body_groups,
-            target_body_indices=self._target_contact_env_body_ids,
+        hand_force = torch.stack(
+            tuple(
+                torch.linalg.norm(self._contact_forces[:, group], dim=-1).amax(dim=1)
+                for group in self._human_contact_body_groups
+            ),
+            dim=1,
         )
-        active = exact.count.sum(axis=1, dtype=np.int32) > 0
-        return distance, active[None, :]
+        region_force = torch.linalg.norm(
+            self._target_contact_forces[:, self._target_contact_body_ids], dim=-1
+        ).amax(dim=1)
+        return distance, hand_force, region_force
 
     def post_physics_step(self):
         super().post_physics_step()
         if not self._rollout_path or self._rollout_written or self.num_envs != 1:
             return
-        distance, active = self._measure_contacts()
+        distance, hand_force, region_force = self._measure_contacts()
         frame = int(self._reference_frame()[0].item())
         self._rollout.append({
             "human_root_state": self._humanoid_root_states[0].detach().cpu().numpy(),
@@ -764,7 +738,8 @@ class InterMimicArticulated(InterMimic):
             "object_link_state": self._target_body_state[0].detach().cpu().numpy(),
             "region_distance_m": distance[0].detach().cpu().numpy(),
             "intended": self._intended_contact[frame].detach().cpu().numpy(),
-            "active": active[0],
+            "hand_force_n": hand_force[0].detach().cpu().numpy(),
+            "region_force_n": region_force[0].detach().cpu().numpy(),
             "terminated": bool(self._terminate_buf[0].item()),
         })
         done = bool(self.reset_buf[0].item()) or frame >= self._q_reference.shape[0] - 1
@@ -793,7 +768,7 @@ class InterMimicArticulated(InterMimic):
                     continue
                 if key == "terminated":
                     padding = np.ones((missing_frames,), dtype=values.dtype)
-                elif key == "active":
+                elif key in {"hand_force_n", "region_force_n"}:
                     padding = np.zeros((missing_frames,) + values.shape[1:], dtype=values.dtype)
                 else:
                     padding = np.repeat(values[-1:], missing_frames, axis=0)
@@ -809,7 +784,7 @@ class InterMimicArticulated(InterMimic):
             "link_names": np.asarray(self._target_asset_body_names),
             "contact_label_names": np.asarray(self._contact_label_names),
             "contact_granularity": np.asarray(self._contact_granularity),
-            "contact_semantics": np.asarray("exact_rigid_pair"),
+            "contact_semantics": np.asarray("hand_and_region_net_force"),
             "q0_source": np.asarray("case_json.object.initial_joint_values"),
             "reset_object_joint_qpos": self._last_env0_reset_qpos,
             "valid_frame_count": np.asarray(valid_frames, dtype=np.int64),
