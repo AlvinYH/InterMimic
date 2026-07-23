@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+
+# Local datasets and checkpoints.
+/InterAct/OMOMO_new/*.pt
+/InterAct/OMOMO_new_original/
+/checkpoints/
+
+# Isaac Gym/Lab installations are external dependencies, not source.
+/IsaacGymEnvs/
+/IsaacLab/
+/isaac-gym-preview-4
+/isaacgym/README.txt
+/isaacgym/assets/
+/isaacgym/create_conda_env_rlgpu.sh
+/isaacgym/docker/
+/isaacgym/docs/
+/isaacgym/licenses/
+/isaacgym/python/
