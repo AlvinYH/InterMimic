@@ -73,7 +73,6 @@ class InterMimic(Humanoid_SMPLX):
         self.hoi_data = self._load_motion(self.motion_file, topk=self.psi)
 
         self._curr_ref_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
-        self._hist_ref_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
         self._curr_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
         self._hist_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
         self._tar_pos = torch.zeros([self.num_envs, 3], device=self.device, dtype=torch.float)
@@ -92,7 +91,7 @@ class InterMimic(Humanoid_SMPLX):
         return
 
     def _update_hist_hoi_obs(self, env_ids=None):
-        self._hist_obs = self._curr_obs.clone()
+        self._hist_obs, self._curr_obs = self._curr_obs, self._hist_obs
         return
         
     def _setup_character_props(self, key_bodies):
@@ -708,7 +707,7 @@ class InterMimic(Humanoid_SMPLX):
     
     def _compute_observations_iter(self, hoi_data, env_ids=None, delta_t=1):
         if (env_ids is None):
-            env_ids = to_torch(np.arange(self.num_envs), device=self.device, dtype=torch.long)
+            env_ids = self._all_env_ids
 
         ts = self.progress_buf[env_ids].clone() 
         next_ts = torch.clamp(ts + delta_t, max=self.max_episode_length[self.data_id[env_ids]]-1)
@@ -836,7 +835,6 @@ class InterMimic(Humanoid_SMPLX):
                 self._sum_reward[reset_ind] = 0
                 return
             start_index, end_index = self.start_times[reset_ind], self.progress_buf[reset_ind]
-            sum_reward = self._sum_reward[reset_ind].mean()
             if torch.rand(1)[0] < 0:
                 self._sum_reward[reset_ind] = 0
                 return
@@ -846,35 +844,47 @@ class InterMimic(Humanoid_SMPLX):
                 return
             curr_reward = self._curr_reward[reset_ind]
             state = self._curr_state[reset_ind]
-            # Initialize the reward tensor with zeros
             reward = torch.zeros((curr_reward.shape[0], self.hoi_refs.shape[0], self.hoi_refs.shape[2]), device=curr_reward.device)
             end_i = torch.minimum(max_episode_length, self.rollout_length + start_index)
 
             assert (end_index < end_i).all()
-            # Loop through each example in the batch to assign the values from curr_reward to the correct slices in reward
-
-            # data_num, sample_choice, time, feature
-
-            for i in range(curr_reward.shape[0]):
-                if end_index[i] > start_index[i]+30:  # Ensure the indices are valid
-                    index_tensor = torch.arange(start_index[i]+10, end_index[i]-10, device=start_index.device)
-                    reward[i, data_id[i], start_index[i]+10:end_index[i]-10] = ((end_index[i] - index_tensor) / (end_i[i] - index_tensor))
+            reset_count = curr_reward.shape[0]
+            starts = start_index[:reset_count]
+            ends = end_index[:reset_count]
+            limits = end_i[:reset_count]
+            motions = data_id[:reset_count]
+            frames = torch.arange(reward.shape[2], device=reward.device)
+            frame_grid = frames.unsqueeze(0)
+            valid = (
+                (ends > starts + 30).unsqueeze(1)
+                & (frame_grid >= starts.unsqueeze(1) + 10)
+                & (frame_grid < ends.unsqueeze(1) - 10)
+            )
+            reset_row, frame = torch.where(valid)
+            values = (
+                (ends.unsqueeze(1) - frame_grid)
+                / (limits.unsqueeze(1) - frame_grid)
+            )
+            reward[reset_row, motions[reset_row], frame] = values[reset_row, frame]
 
             adjust_reward, adjust_reward_index = reward.max(dim=0)
-            for i in range(reward.shape[1]):
-                if self.max_episode_length[i] < self.rollout_length:
-                    continue
-                for j in range(reward.shape[2]):
-                    if self.max_episode_length[i] - j < self.rollout_length:
-                        break
-                    value, index = self.ref_reward[i, 1:, j].min(dim=0)
-                    index = index + 1
-                    id1 = adjust_reward_index[i, j]
-                    idx = j - start_index[adjust_reward_index[i, j]]
-
-                    if idx > 0 and idx < self.rollout_length and adjust_reward[i, j] > 0.5:
-                        self.ref_reward[i, index, j] = adjust_reward[i, j]
-                        self.hoi_refs[i, index, j] = state[id1, idx]
+            _, slot = self.ref_reward[:, 1:, :].min(dim=1)
+            slot = slot + 1
+            frame_grid = frames.unsqueeze(0).expand(reward.shape[1], -1)
+            winner_start = starts[adjust_reward_index]
+            state_frame = frame_grid - winner_start
+            valid = (
+                (self.max_episode_length.unsqueeze(1) - frame_grid >= self.rollout_length)
+                & (state_frame > 0)
+                & (state_frame < self.rollout_length)
+                & (adjust_reward > 0.5)
+            )
+            motion, frame = torch.where(valid)
+            target_slot = slot[motion, frame]
+            winner = adjust_reward_index[motion, frame]
+            source_frame = state_frame[motion, frame]
+            self.ref_reward[motion, target_slot, frame] = adjust_reward[motion, frame]
+            self.hoi_refs[motion, target_slot, frame] = state[winner, source_frame]
             self.ref_reward[:, 1:, :] = self.ref_reward[:, 1:, :] * (1 - 1e-5)
         return
 
@@ -906,6 +916,12 @@ class InterMimic(Humanoid_SMPLX):
         rig, ig_reset = self.compute_ig_reward(self.reward_weights, key_pos, ref_key_pos, obj_points, ref_obj_points)
         rcg, contact_reset = self.compute_cg_reward(self.reward_weights)
         self.rew_buf[:] = rb * ro * rig * rcg
+        if self._termination_grace_steps is not None:
+            past_grace = (
+                self.progress_buf
+                > self._termination_grace_steps + self.start_times
+            )
+            contact_reset *= past_grace.unsqueeze(-1)
         kinematic_reset = torch.logical_or(human_reset, object_reset)
         self.contact_reset = (self.contact_reset + contact_reset) * contact_reset
         self.kinematic_reset = torch.logical_or(ig_reset, kinematic_reset)
@@ -1306,6 +1322,8 @@ def compute_sdf(points1, points2):
     dis_mat = points1.unsqueeze(2) - points2.unsqueeze(1)
     dis_mat_lengths = torch.norm(dis_mat, dim=-1)
     min_length_indices = torch.argmin(dis_mat_lengths, dim=-1)
-    B_indices, N_indices = torch.meshgrid(torch.arange(points1.shape[0]), torch.arange(points1.shape[1]), indexing='ij')
-    min_dis_mat = dis_mat[B_indices, N_indices, min_length_indices].contiguous()
+    gather_index = min_length_indices.unsqueeze(-1).unsqueeze(-1).expand(
+        -1, -1, 1, dis_mat.shape[-1]
+    )
+    min_dis_mat = dis_mat.gather(2, gather_index).squeeze(2).contiguous()
     return min_dis_mat

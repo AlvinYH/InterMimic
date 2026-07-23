@@ -558,7 +558,13 @@ class InterMimicAgent(common_agent.CommonAgent):
             for i in range(len(self.dataset)):
                 curr_train_info = self.train_actor_critic(self.dataset[i])
 
-                if self.schedule_type == 'legacy':
+                if (
+                    self.schedule_type == 'legacy'
+                    and (
+                        self.multi_gpu
+                        or self.scheduler.__class__.__name__ != 'IdentityScheduler'
+                    )
+                ):
                     kl_step = curr_train_info['kl']
                     if self.multi_gpu:
                         kl_step = self._ddp_average_value(kl_step)
@@ -577,7 +583,13 @@ class InterMimicAgent(common_agent.CommonAgent):
                 step_kls.append(curr_train_info['kl'])
 
             av_kls = torch_ext.mean_list(step_kls)   # <---- back to torch_ext
-            if self.schedule_type == 'standard':
+            if (
+                self.schedule_type == 'standard'
+                and (
+                    self.multi_gpu
+                    or self.scheduler.__class__.__name__ != 'IdentityScheduler'
+                )
+            ):
                 if self.multi_gpu:
                     av_kls = self._ddp_average_value(av_kls)
                 self.last_lr, self.entropy_coef = self.scheduler.update(
@@ -587,7 +599,13 @@ class InterMimicAgent(common_agent.CommonAgent):
 
             epoch_kls.append(av_kls)
 
-        if self.schedule_type == 'standard_epoch':
+        if (
+            self.schedule_type == 'standard_epoch'
+            and (
+                self.multi_gpu
+                or self.scheduler.__class__.__name__ != 'IdentityScheduler'
+            )
+        ):
             epoch_av_kl = torch_ext.mean_list(epoch_kls)  # <---- again use torch_ext
             if self.multi_gpu:
                 epoch_av_kl = self._ddp_average_value(epoch_av_kl)
@@ -772,7 +790,7 @@ class InterMimicAgent(common_agent.CommonAgent):
         return
     
     def get_cpu_usage(self):
-        return psutil.cpu_percent(interval=1)
+        return psutil.cpu_percent(interval=None)
 
     def get_cpu_memory_usage(self):
         return psutil.virtual_memory().percent

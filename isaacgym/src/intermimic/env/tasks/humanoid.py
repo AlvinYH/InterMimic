@@ -82,6 +82,9 @@ class Humanoid_SMPLX(BaseTask):
         super().__init__(cfg=self.cfg)
         
         self.dt = self.control_freq_inv * sim_params.dt
+        self._all_env_ids = torch.arange(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
         
         # get gym GPU state tensors
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
@@ -413,10 +416,9 @@ class Humanoid_SMPLX(BaseTask):
         self.progress_buf += 1
                 
         self._refresh_sim_tensors()
-        env_ids = to_torch(np.arange(self.num_envs), device=self.device, dtype=torch.long)
         self._update_hist_hoi_obs()
         self._compute_hoi_observations()
-        self._compute_observations(env_ids)
+        self._compute_observations(self._all_env_ids)
         self._compute_reward(self.actions)
         self._compute_reset()
 
