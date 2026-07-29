@@ -163,7 +163,10 @@ class InterMimicAgent(common_agent.CommonAgent):
     
     def train(self):
         if self.resume_from != 'None':
-            self.restore(self.resume_from)
+            try:
+                self.restore(self.resume_from)
+            except:
+                print('Failed to restore from checkpoint')
 
         self.init_tensors()
         self.last_mean_rewards = -100500

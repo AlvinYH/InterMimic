@@ -275,7 +275,9 @@ def main():
     cfg_train['params']['config']['train_dir'] = args.output_path
     
     vargs = vars(args)
-    if args.train:
+    if args.train and vargs["checkpoint"] == "Base":
+        # rl-games 1.6 treats the author's default sentinel as a file path.
+        # The author resume_from config remains the training restore mechanism.
         vargs["checkpoint"] = ""
 
     algo_observer = RLGPUAlgoObserver()
