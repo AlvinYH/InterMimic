@@ -33,6 +33,7 @@ from .utils.config import set_np_formatting, set_seed, get_args, parse_sim_param
 from .utils.parse_task import parse_task
 
 from rl_games.algos_torch import torch_ext
+from rl_games.algos_torch import model_builder
 from rl_games.common import env_configurations, vecenv
 from rl_games.common.algo_observer import AlgoObserver
 from rl_games.torch_runner import Runner
@@ -84,7 +85,7 @@ def create_rlgpu_env(**kwargs):
     # bind this process to its GPU
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
-        args.device = args.sim_device_type if args.use_gpu_pipeline else 'cpu'
+        args.device = 'cuda'
         args.device_id = local_rank
         args.rl_device = f'cuda:{local_rank}'
         cfg['rank'] = rank
@@ -206,10 +207,15 @@ env_configurations.register('rlgpu', {
 def build_alg_runner(algo_observer):
     runner = Runner(algo_observer)
 
-    runner.algo_factory.register_builder('intermimic', lambda **kwargs : intermimic_agent.InterMimicAgent(**kwargs))
+    def build_agent(base_name, params, **_):
+        config = copy.deepcopy(params["config"])
+        config["network"] = model_builder.ModelBuilder().load(params)
+        return intermimic_agent.InterMimicAgent(base_name, config)
+
+    runner.algo_factory.register_builder('intermimic', build_agent)
     runner.player_factory.register_builder('intermimic', lambda **kwargs : intermimic_players.InterMimicPlayerContinuous(**kwargs))
-    runner.model_builder.model_factory.register_builder('intermimic', lambda network, **kwargs : intermimic_models.ModelInterMimicContinuous(network))  
-    runner.model_builder.network_factory.register_builder('intermimic', lambda **kwargs : intermimic_network_builder.InterMimicBuilder())
+    model_builder.register_model('intermimic', intermimic_models.ModelInterMimicContinuous)
+    model_builder.register_network('intermimic', intermimic_network_builder.InterMimicBuilder)
 
     return runner
 
@@ -269,6 +275,8 @@ def main():
     cfg_train['params']['config']['train_dir'] = args.output_path
     
     vargs = vars(args)
+    if args.train:
+        vargs["checkpoint"] = ""
 
     algo_observer = RLGPUAlgoObserver()
 

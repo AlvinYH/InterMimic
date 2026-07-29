@@ -60,13 +60,6 @@ class Humanoid_SMPLX(BaseTask):
         self._local_root_obs = self.cfg["env"]["localRootObs"]
         self._root_height_obs = self.cfg["env"].get("rootHeightObs", True)
         self._enable_early_termination = self.cfg["env"]["enableEarlyTermination"]
-        self._termination_grace_steps = self.cfg["env"].get(
-            "terminationGraceSteps"
-        )
-        if self._termination_grace_steps is not None:
-            self._termination_grace_steps = int(self._termination_grace_steps)
-            if self._termination_grace_steps < 1:
-                raise ValueError("terminationGraceSteps must be positive")
         
         key_bodies = self.cfg["env"]["keyBodies"]
         self.key_bodies = key_bodies
@@ -82,9 +75,6 @@ class Humanoid_SMPLX(BaseTask):
         super().__init__(cfg=self.cfg)
         
         self.dt = self.control_freq_inv * sim_params.dt
-        self._all_env_ids = torch.arange(
-            self.num_envs, device=self.device, dtype=torch.long
-        )
         
         # get gym GPU state tensors
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
@@ -94,8 +84,9 @@ class Humanoid_SMPLX(BaseTask):
 
 
         dof_force_tensor = self.gym.acquire_dof_force_tensor(self.sim)
-        dof_forces_per_env = gymtorch.wrap_tensor(dof_force_tensor).view(self.num_envs, -1)
-        self.dof_force_tensor = dof_forces_per_env[..., :self.num_dof]
+        self.dof_force_tensor = gymtorch.wrap_tensor(dof_force_tensor).view(
+            self.num_envs, -1
+        )[..., :self.num_dof]
         
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
@@ -204,7 +195,6 @@ class Humanoid_SMPLX(BaseTask):
     def _create_ground_plane(self):
         plane_params = gymapi.PlaneParams()
         plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
-        plane_params.distance = -float(self.cfg["env"]["plane"].get("height", 0.0))
         plane_params.static_friction = self.plane_static_friction
         plane_params.dynamic_friction = self.plane_dynamic_friction
         plane_params.restitution = self.plane_restitution
@@ -270,8 +260,12 @@ class Humanoid_SMPLX(BaseTask):
         self.dof_limits_lower = []
         self.dof_limits_upper = []
 
-        max_agg_bodies = self.num_humanoid_bodies + self.target_aggregate_body_capacity
-        max_agg_shapes = self.num_humanoid_shapes + self.target_aggregate_shape_capacity
+        max_agg_bodies = (
+            self.num_humanoid_bodies + self.target_aggregate_body_capacity
+        )
+        max_agg_shapes = (
+            self.num_humanoid_shapes + self.target_aggregate_shape_capacity
+        )
         
         for i in range(self.num_envs):
             # create env instance
@@ -416,9 +410,10 @@ class Humanoid_SMPLX(BaseTask):
         self.progress_buf += 1
                 
         self._refresh_sim_tensors()
+        env_ids = to_torch(np.arange(self.num_envs), device=self.device, dtype=torch.long)
         self._update_hist_hoi_obs()
         self._compute_hoi_observations()
-        self._compute_observations(self._all_env_ids)
+        self._compute_observations(env_ids)
         self._compute_reward(self.actions)
         self._compute_reset()
 
@@ -495,14 +490,12 @@ class Humanoid_SMPLX(BaseTask):
         body_height = rigid_body_pos[:, 0, 2] # root height
         body_fall = body_height < termination_heights# [4096] 
         has_failed = body_fall.clone()
-        if self._termination_grace_steps is None:
-            has_failed *= progress_buf > 1
-        else:
-            has_failed *= progress_buf > self._termination_grace_steps + start_times
-        invalid_batches = ~torch.isfinite(obs_buf).all(dim=1)
-        torch._assert_async(
-            ~invalid_batches.any(), "invalid observation"
-        )
+        has_failed *= (progress_buf > 1)
+        invalid_obs = ~torch.isfinite(obs_buf)  # True where obs is NaN or infinite
+        invalid_batches = torch.any(invalid_obs, dim=1)  # Check if any invalid number in each batch (B, N)
+        if torch.any(invalid_obs):
+            print("invalid observation")
+            raise Exception("invalid observation")
             
         terminated = torch.where(torch.logical_or(invalid_batches, has_failed), torch.ones_like(reset_buf), terminated)
         reset = torch.where(torch.logical_or(progress_buf >= max_episode_length-1, progress_buf - start_times >= rollout_length-1), torch.ones_like(reset_buf), terminated)

@@ -3,7 +3,6 @@ import os
 from rl_games.common import tr_helpers
 from rl_games.common import vecenv
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
-from rl_games.algos_torch.moving_mean_std import MovingMeanStd
 from rl_games.algos_torch.self_play_manager import SelfPlayManager
 from rl_games.algos_torch import torch_ext
 from rl_games.common import schedulers

@@ -38,11 +38,17 @@ class ModelInterMimicContinuous(ModelA2CContinuousLogStd):
         net = self.network_builder.build('intermimic', **config)
         for name, _ in net.named_parameters():
             print(name)
-        return ModelInterMimicContinuous.Network(net)
+        return ModelInterMimicContinuous.Network(
+            net,
+            obs_shape=config["input_shape"],
+            normalize_value=False,
+            normalize_input=False,
+            value_size=config.get("value_size", 1),
+        )
 
     class Network(ModelA2CContinuousLogStd.Network):
-        def __init__(self, a2c_network):
-            super().__init__(a2c_network)
+        def __init__(self, a2c_network, **kwargs):
+            super().__init__(a2c_network, **kwargs)
             return
 
         def forward(self, input_dict):

@@ -29,6 +29,8 @@
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from rl_games.algos_torch import torch_ext
 from . import a2c_common
+import psutil
+import subprocess
 from isaacgym.torch_utils import *
 
 import time
@@ -66,8 +68,6 @@ class InterMimicAgent(common_agent.CommonAgent):
         if self._normalize_input:
             self._input_mean_std = RunningMeanStd(self._amp_observation_space.shape).to(self.ppo_device)
         self.resume_from = config['resume_from']
-        self.policy_init_from = config['policy_init_from']
-        self.schedule_start_epoch = config['schedule_start_epoch']
         self.done_indices = []
         self.epoch_num_start = 0
         return
@@ -164,11 +164,6 @@ class InterMimicAgent(common_agent.CommonAgent):
     def train(self):
         if self.resume_from != 'None':
             self.restore(self.resume_from)
-        else:
-            if self.policy_init_from != 'None':
-                self.initialize_policy(self.policy_init_from)
-            self.epoch_num = self.schedule_start_epoch
-            self.epoch_num_start = self.schedule_start_epoch
 
         self.init_tensors()
         self.last_mean_rewards = -100500
@@ -277,62 +272,6 @@ class InterMimicAgent(common_agent.CommonAgent):
         # not reached
         return
 
-    def initialize_policy(self, fn):
-        """Initialize model statistics without restoring optimizer or run state."""
-
-        checkpoint = torch_ext.load_checkpoint(fn)
-        current = self.model.state_dict()
-        source = checkpoint['model']
-        expanded = {}
-        input_layers = {
-            'a2c_network.actor_mlp.0.weight',
-            'a2c_network.critic_mlp.0.weight',
-        }
-        for name, target in current.items():
-            value = source[name].to(device=target.device, dtype=target.dtype)
-            if value.shape == target.shape:
-                expanded[name] = value
-            elif (
-                name in input_layers
-                and value.ndim == 2
-                and target.ndim == 2
-                and value.shape[0] == target.shape[0]
-                and value.shape[1] < target.shape[1]
-            ):
-                initialized = torch.zeros_like(target)
-                initialized[:, :value.shape[1]] = value
-                expanded[name] = initialized
-            else:
-                raise ValueError(
-                    f'Policy init shape mismatch for {name}: {tuple(value.shape)} vs '
-                    f'{tuple(target.shape)}'
-                )
-        self.model.load_state_dict(expanded)
-
-        if self.normalize_input:
-            current_stats = self.running_mean_std.state_dict()
-            source_stats = checkpoint['running_mean_std']
-            initialized_stats = {}
-            for name, target in current_stats.items():
-                value = source_stats[name].to(device=target.device, dtype=target.dtype)
-                if value.shape == target.shape:
-                    initialized_stats[name] = value
-                elif name in {'running_mean', 'running_var'} and value.numel() < target.numel():
-                    initialized = torch.zeros_like(target)
-                    if name == 'running_var':
-                        initialized.fill_(1.0)
-                    initialized[:value.numel()] = value.reshape(-1)
-                    initialized_stats[name] = initialized
-                else:
-                    raise ValueError(
-                        f'Observation statistics shape mismatch for {name}: '
-                        f'{tuple(value.shape)} vs {tuple(target.shape)}'
-                    )
-            self.running_mean_std.load_state_dict(initialized_stats)
-        if self._normalize_input:
-            self._input_mean_std.load_state_dict(checkpoint['amp_input_mean_std'])
-        return
-
     def init_tensors(self):
         super().init_tensors()
         self._build_rand_action_probs()
@@ -342,26 +281,49 @@ class InterMimicAgent(common_agent.CommonAgent):
         return
     
     def set_eval(self):
-        super().set_eval()
+        self.model.eval()
+        if self.normalize_input:
+            self.running_mean_std.eval()
+        if self.normalize_value:
+            self.value_mean_std.eval()
         if self._normalize_input:
             self._input_mean_std.eval()
         return
 
     def set_train(self):
-        super().set_train()
+        self.model.train()
+        if self.normalize_input:
+            self.running_mean_std.train()
+        if self.normalize_value:
+            self.value_mean_std.train()
         if self._normalize_input:
             self._input_mean_std.train()
         return
 
     def get_stats_weights(self):
-        state = super().get_stats_weights()
+        state = {}
+        if self.normalize_input:
+            state['running_mean_std'] = self.running_mean_std.state_dict()
+        if self.normalize_value:
+            state['reward_mean_std'] = self.value_mean_std.state_dict()
+        if self.has_central_value:
+            state['assymetric_vf_mean_std'] = self.central_value_net.get_stats_weights()
+        if self.mixed_precision:
+            state['scaler'] = self.scaler.state_dict()
         if self._normalize_input:
             state['amp_input_mean_std'] = self._input_mean_std.state_dict()
         
         return state
 
     def set_stats_weights(self, weights):
-        super().set_stats_weights(weights)
+        if self.normalize_input:
+            self.running_mean_std.load_state_dict(weights['running_mean_std'])
+        if self.normalize_value:
+            self.value_mean_std.load_state_dict(weights['reward_mean_std'])
+        if self.has_central_value:
+            self.central_value_net.set_stats_weights(weights['assymetric_vf_mean_std'])
+        if self.mixed_precision and 'scaler' in weights:
+            self.scaler.load_state_dict(weights['scaler'])
         if self._normalize_input:
             self._input_mean_std.load_state_dict(weights['amp_input_mean_std'])
         return
@@ -401,10 +363,16 @@ class InterMimicAgent(common_agent.CommonAgent):
 
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
 
-            invalid_batches = ~torch.isfinite(self.obs['obs']).all(dim=1)
-            self.obs['obs'][invalid_batches] = 0
-            self.dones[invalid_batches] = True
-            infos['terminate'][invalid_batches] = True
+            invalid_obs = ~torch.isfinite(self.obs['obs'])  # True where obs is NaN or infinite
+            invalid_batches = torch.any(invalid_obs, dim=1)  # Check if any invalid number in each batch (B, N)
+
+            if torch.any(invalid_obs):
+                print("invalid observation")
+                print(torch.where(invalid_obs))
+                self.obs['obs'][invalid_batches] = 0
+            # Set self.dones to True for batches with invalid observations
+                self.dones[invalid_batches] = True
+                infos['terminate'][invalid_batches] = True
 
             shaped_rewards = self.rewards_shaper(rewards)
             # shaped_rewards = shaped_rewards * (((res_dict['actions'] - res_dict['mus'])**2).sum(dim=-1).mul(-0.01).exp().unsqueeze(-1))
@@ -550,13 +518,7 @@ class InterMimicAgent(common_agent.CommonAgent):
             for i in range(len(self.dataset)):
                 curr_train_info = self.train_actor_critic(self.dataset[i])
 
-                if (
-                    self.schedule_type == 'legacy'
-                    and (
-                        self.multi_gpu
-                        or self.scheduler.__class__.__name__ != 'IdentityScheduler'
-                    )
-                ):
+                if self.schedule_type == 'legacy':
                     kl_step = curr_train_info['kl']
                     if self.multi_gpu:
                         kl_step = self._ddp_average_value(kl_step)
@@ -575,13 +537,7 @@ class InterMimicAgent(common_agent.CommonAgent):
                 step_kls.append(curr_train_info['kl'])
 
             av_kls = torch_ext.mean_list(step_kls)   # <---- back to torch_ext
-            if (
-                self.schedule_type == 'standard'
-                and (
-                    self.multi_gpu
-                    or self.scheduler.__class__.__name__ != 'IdentityScheduler'
-                )
-            ):
+            if self.schedule_type == 'standard':
                 if self.multi_gpu:
                     av_kls = self._ddp_average_value(av_kls)
                 self.last_lr, self.entropy_coef = self.scheduler.update(
@@ -591,13 +547,7 @@ class InterMimicAgent(common_agent.CommonAgent):
 
             epoch_kls.append(av_kls)
 
-        if (
-            self.schedule_type == 'standard_epoch'
-            and (
-                self.multi_gpu
-                or self.scheduler.__class__.__name__ != 'IdentityScheduler'
-            )
-        ):
+        if self.schedule_type == 'standard_epoch':
             epoch_av_kl = torch_ext.mean_list(epoch_kls)  # <---- again use torch_ext
             if self.multi_gpu:
                 epoch_av_kl = self._ddp_average_value(epoch_av_kl)
@@ -781,6 +731,21 @@ class InterMimicAgent(common_agent.CommonAgent):
         super()._record_train_batch_info(batch_dict, train_info)
         return
     
+    def get_cpu_usage(self):
+        return psutil.cpu_percent(interval=1)
+
+    def get_cpu_memory_usage(self):
+        return psutil.virtual_memory().percent
+    
+    # Function to get GPU usage
+    def get_gpu_usage(self):
+        result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader'], stdout=subprocess.PIPE)
+        return int(result.stdout.decode().strip().split()[0])
+    
+    # Function to get GPU memory usage
+    def get_gpu_memory_usage(self):
+        return torch.cuda.memory_allocated() / 1e9
+
     def _log_train_info(self, train_info, frame):
         self.writer.add_scalar('performance/update_time', train_info['update_time'], frame)
         self.writer.add_scalar('performance/play_time', train_info['play_time'], frame)
@@ -794,5 +759,10 @@ class InterMimicAgent(common_agent.CommonAgent):
         self.writer.add_scalar('info/e_clip', self.e_clip * train_info['lr_mul'][-1], frame)
         self.writer.add_scalar('info/clip_frac', torch_ext.mean_list(train_info['actor_clip_frac']).item(), frame)
         self.writer.add_scalar('info/kl', torch_ext.mean_list(train_info['kl']).item(), frame)
+
+        self.writer.add_scalar('usage/cpu', self.get_cpu_usage(), frame)
+        self.writer.add_scalar('usage/gpu', self.get_gpu_usage(), frame)
+        self.writer.add_scalar('usage/cpu_memory', self.get_cpu_memory_usage(), frame)
+        self.writer.add_scalar('usage/gpu_memory', self.get_gpu_memory_usage(), frame)
 
         return

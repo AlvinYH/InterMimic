@@ -101,7 +101,7 @@ dependencies:
       - referencing==0.34.0
       - requests==2.31.0
       - requests-oauthlib==2.0.0
-      - rl-games==1.1.4
+      - rl-games==1.6.1
       - rpds-py==0.18.0
       - rsa==4.9
       - scikit-image==0.19.3

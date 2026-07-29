@@ -36,9 +36,10 @@ from rl_games.common.player import BasePlayer
 import numpy as np
 
 class CommonPlayer(players.PpoPlayerContinuous):
-    def __init__(self, config):
-        BasePlayer.__init__(self, config)
-        self.network = config['network']
+    def __init__(self, params):
+        BasePlayer.__init__(self, params)
+        self.network = self.config['network']
+        self.is_determenistic = self.is_deterministic
         
         self._setup_action_space()
         self.mask = [False]

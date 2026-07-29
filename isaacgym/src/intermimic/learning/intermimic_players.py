@@ -26,10 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import json
-import time
-
-import torch
+import torch, time 
 
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
@@ -37,10 +34,10 @@ from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from . import common_player
 
 class InterMimicPlayerContinuous(common_player.CommonPlayer):
-    def __init__(self, config):
-        self._normalize_amp_input = config.get('normalize_amp_input', False)
+    def __init__(self, params):
+        self._normalize_amp_input = params["config"].get('normalize_amp_input', False)
         
-        super().__init__(config)
+        super().__init__(params)
         return
 
     def run(self):
@@ -53,7 +50,6 @@ class InterMimicPlayerContinuous(common_player.CommonPlayer):
         sum_game_res = 0
         n_games = n_games * n_game_life * 10
         games_played = 0
-        evaluation = self.env.task.enable_evaluation
         has_masks = False
         has_masks_func = getattr(self.env, "has_action_mask", None) is not None
 
@@ -66,9 +62,7 @@ class InterMimicPlayerContinuous(common_player.CommonPlayer):
 
         need_init_rnn = self.is_rnn
         for _ in range(n_games):
-            if evaluation and self.env.task.evaluation_complete():
-                break
-            if not evaluation and games_played >= n_games:
+            if games_played >= n_games:
                 break
 
             obs_dict = self.env_reset()
@@ -143,62 +137,24 @@ class InterMimicPlayerContinuous(common_player.CommonPlayer):
                             else:
                                 print('reward:', cur_rewards/done_count, 'steps:', cur_steps/done_count)
                         sum_game_res += game_res
-                        if batch_size//self.num_agents == 1 or (
-                            not evaluation and games_played >= n_games
-                        ):
+                        if batch_size//self.num_agents == 1 or games_played >= n_games:
                             break
-
-                    if evaluation and self.env.task.evaluation_complete():
-                        break
                     
                     done_indices = done_indices[:, 0]
 
-        if evaluation:
-            report = self.env.task.evaluation_report()
-            coverage = report["coverage"]
-            success = report["success"]
-            metrics = report["metrics"]
-            visits = [motion["visits"] for motion in report["motions"]]
-
-            print("\n" + "=" * 60)
-            print("FINAL EVALUATION SUMMARY:")
-            print(
-                f"  Sequences Evaluated: {coverage['evaluated']}/{coverage['total']} "
-                f"({100.0 * coverage['evaluated'] / coverage['total']:.1f}%)"
-            )
-            print(
-                f"  Sequence Visits - Min: {min(visits)}, Max: {max(visits)}, "
-                f"Avg: {sum(visits) / len(visits):.1f}"
-            )
-            if metrics["evaluated_count"]:
-                print(
-                    f"  Average Execution Steps: "
-                    f"{metrics['average_execution_steps']:.2f}"
-                )
-                print(
-                    f"  Average Human Pose Error: "
-                    f"{metrics['average_human_pose_error']:.4f}"
-                )
-                print(
-                    f"  Average Object Pose Error: "
-                    f"{metrics['average_object_pose_error']:.4f}"
-                )
-            else:
-                print("  No sequences were evaluated before the safety cap")
-            print(
-                f"  Success Rate: {success['rate']:.2%} "
-                f"({success['count']}/{success['denominator']})"
-            )
-            print("=" * 60)
-            print("INTERMIMIC_EVALUATION_JSON: " + json.dumps(report, sort_keys=True))
+        # Print final evaluation summary if evaluation is enabled
+        if hasattr(self.env.task, 'print_final_eval_summary'):
+            self.env.task.print_final_eval_summary()
 
         return
     
     def restore(self, fn):
         if (fn != 'Base'):
-            super().restore(fn)
+            checkpoint = torch_ext.load_checkpoint(fn)
+            self.model.load_state_dict(checkpoint['model'])
+            if self.normalize_input:
+                self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
             if self._normalize_amp_input:
-                checkpoint = torch_ext.load_checkpoint(fn)
                 self._amp_input_mean_std.load_state_dict(checkpoint['amp_input_mean_std'])
         return
     

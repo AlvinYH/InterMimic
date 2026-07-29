@@ -13,7 +13,6 @@ from .humanoid import *
 import trimesh
 
 from ...utils.path_utils import resolve_data_path
-from ...evaluation import select_evaluation_motion, validate_evaluation_report
 
 
 
@@ -71,15 +70,9 @@ class InterMimic(Humanoid_SMPLX):
                          headless=headless)
         
         self.hoi_data = self._load_motion(self.motion_file, topk=self.psi)
-        self._reference_update_possible = bool(
-            torch.any(self.max_episode_length > self.rollout_length).item()
-        )
-        self._single_motion_fixed_start = (
-            self.num_motions == 1
-            and int(self.max_episode_length[0].item()) - self.rollout_length <= 1
-        )
 
         self._curr_ref_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
+        self._hist_ref_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
         self._curr_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
         self._hist_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
         self._tar_pos = torch.zeros([self.num_envs, 3], device=self.device, dtype=torch.float)
@@ -98,7 +91,7 @@ class InterMimic(Humanoid_SMPLX):
         return
 
     def _update_hist_hoi_obs(self, env_ids=None):
-        self._hist_obs, self._curr_obs = self._curr_obs, self._hist_obs
+        self._hist_obs = self._curr_obs.clone()
         return
         
     def _setup_character_props(self, key_bodies):
@@ -250,39 +243,53 @@ class InterMimic(Humanoid_SMPLX):
             'obj_pos', 'obj_rot', 'obj_pos_vel', 'obj_rot_vel', 'ig', 'contact_human', 'contact_obj'
         ]
 
-        start = 0
-        self.data_component_slices = {}
-        for name in self.data_component_order:
-            end = start + loaded_dict[name].shape[1]
-            self.data_component_slices[name] = slice(start, end)
-            start = end
+        # Precompute the sizes for each component.
+        data_component_sizes = [
+            loaded_dict[name].shape[1]
+            for name in self.data_component_order
+        ]
+
+        # Precompute cumulative indices. The first index is zero.
+        # For each i, calculate the sum of component_sizes[:i] to determine the starting index for that component.
+        self.data_component_index = [sum(data_component_sizes[:i]) for i in range(len(data_component_sizes) + 1)]
 
         self.ref_component_order = [
             'root_pos', 'root_rot', 'root_pos_vel', 'root_rot_vel', 'dof_pos', 'dof_vel', 'obj_pos', 'obj_rot', 
             'obj_pos_vel', 'obj_rot_vel'
         ]
 
-        start = 0
-        self.ref_component_slices = {}
-        for name in self.ref_component_order:
-            end = start + loaded_dict[name].shape[1]
-            self.ref_component_slices[name] = slice(start, end)
-            start = end
+        # Precompute the sizes for each component.
+        ref_component_sizes = [
+            loaded_dict[name].shape[1]
+            for name in self.ref_component_order
+        ]
+
+        # Precompute cumulative indices. The first index is zero.
+        # For each i, calculate the sum of component_sizes[:i] to determine the starting index for that component.
+        self.ref_component_index = [sum(ref_component_sizes[:i]) for i in range(len(ref_component_sizes) + 1)]
 
     def extract_ref_component(self, var_name, data_id, ref_index, t):
-        return self.hoi_refs[
-            data_id, ref_index, t, self.ref_component_slices[var_name]
-        ]
+        index = self.ref_component_order.index(var_name)
+        
+        # The number of columns to extract for this component.
+        start = self.ref_component_index[index]
+        end = self.ref_component_index[index+1]
+        
+        return self.hoi_refs[data_id, ref_index, t, start:end]
 
 
     def extract_data_component(self, var_name, ref=False, data_id=None, t=None, obs=None):
+        index = self.data_component_order.index(var_name)
+        
+        # The number of columns to extract for this component.
+        start = self.data_component_index[index]
+        end = self.data_component_index[index+1]
+        
         if ref and data_id is not None and t is not None:
-            return self.hoi_data[
-                data_id, t, self.data_component_slices[var_name]
-            ]
+            return self.hoi_data[data_id, t, start:end]
         
         if obs is not None:
-            return obs[..., self.data_component_slices[var_name]]
+            return obs[..., start:end]
 
     def _create_envs(self, num_envs, spacing, num_per_row):
 
@@ -377,20 +384,10 @@ class InterMimic(Humanoid_SMPLX):
         return
     
     def _reset_target(self, env_ids):
-        device = self._target_states.device
-        reference = {
-            name: self.extract_ref_component(
-                name,
-                self.data_id[env_ids],
-                self.ref_index[env_ids],
-                self.progress_buf[env_ids],
-            ).to(device)
-            for name in ("obj_pos", "obj_rot", "obj_pos_vel", "obj_rot_vel")
-        }
-        self._target_states[env_ids, :3] = reference["obj_pos"]
-        self._target_states[env_ids, 3:7] = reference["obj_rot"]
-        self._target_states[env_ids, 7:10] = reference["obj_pos_vel"]
-        self._target_states[env_ids, 10:13] = reference["obj_rot_vel"]
+        self._target_states[env_ids, :3] = self.extract_ref_component('obj_pos', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
+        self._target_states[env_ids, 3:7] = self.extract_ref_component('obj_rot', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
+        self._target_states[env_ids, 7:10] = self.extract_ref_component('obj_pos_vel', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
+        self._target_states[env_ids, 10:13] = self.extract_ref_component('obj_rot_vel', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
         return  
 
     def _reset_env_tensors(self, env_ids):
@@ -435,25 +432,35 @@ class InterMimic(Humanoid_SMPLX):
     def _reset_ref_state_init(self, env_ids):
         num_envs = env_ids.shape[0]
 
-        # Evaluation covers every object-compatible motion before repeating one.
+        # During evaluation, prioritize undersampled sequences for balanced coverage
         if self.enable_evaluation:
             i = []
             for env_idx in env_ids:
+                # Get valid motion indices for this object type
                 obj_type = env_idx % len(self.object_name)
                 valid_motions = torch.where(self.obj2motion[obj_type] == 1)[0]
-                selected_motion = select_evaluation_motion(
-                    valid_motions,
-                    self._max_execution_steps,
-                    self._sequence_visit_count,
-                )
+
+                # Get visit counts for valid motions
+                visit_counts = self._sequence_visit_count[valid_motions]
+
+                # Sample with inverse probability (prioritize less visited sequences)
+                # Add 1 to avoid division by zero
+                inv_counts = 1.0 / (visit_counts.float() + 1.0)
+                probs = inv_counts / inv_counts.sum()
+
+                # Sample based on inverse visit counts
+                sampled_idx = torch.multinomial(probs, 1).item()
+                selected_motion = valid_motions[sampled_idx]
                 i.append(selected_motion)
-                # Update immediately so environments reset in this batch do not
-                # all receive the same least-visited motion.
-                self._sequence_visit_count[selected_motion] += 1
-            i = torch.stack(i).to(device=self.device, dtype=torch.long)
+
+            i = to_torch(i, device=self.device, dtype=torch.long)
+
+            # Update visit counts
+            for motion_id in i:
+                self._sequence_visit_count[motion_id] += 1
         else:
             # Original random sampling for training
-            i = self._sample_motion_ids(env_ids)
+            i = to_torch([torch.where(self.obj2motion[i % len(self.object_name)] == 1)[0][torch.randint(self.obj2motion[i % len(self.object_name)].sum(), ())] for i in env_ids], device=self.device, dtype=torch.long)
 
         if (self._state_init == InterMimic.StateInit.Random
             or self._state_init == InterMimic.StateInit.Hybrid):
@@ -493,12 +500,13 @@ class InterMimic(Humanoid_SMPLX):
 
     def _reset_hybrid_state_init(self, env_ids):
         num_envs = env_ids.shape[0]
-        i = self._sample_motion_ids(env_ids)
+        i = to_torch([torch.where(self.obj2motion[i % len(self.object_name)] == 1)[0][torch.randint(self.obj2motion[i % len(self.object_name)].sum(), ())] for i in env_ids], device=self.device, dtype=torch.long)
         ref_probs = to_torch(np.array([self._hybrid_init_prob] * num_envs), device=self.device)
         ref_init_mask = torch.bernoulli(ref_probs) == 1.0
-        motion_times = self._sample_hybrid_motion_times(
-            i, env_ids, ref_init_mask
-        )
+
+        ref_reset_ids = env_ids[ref_init_mask]
+
+        motion_times = torch.cat([torch.searchsorted(self.cal_cdf(i, e), torch.rand(1).to(self.device)) if env_ids[e] not in ref_reset_ids else torch.zeros((1,), device=self.device, dtype=torch.long) for e in range(num_envs)]) 
         ref_reward = self.ref_reward[i, :, motion_times] 
         prob = ref_reward / ref_reward.sum(1, keepdim=True)
 
@@ -521,58 +529,7 @@ class InterMimic(Humanoid_SMPLX):
                             )
         return
 
-    def _sample_motion_ids(self, env_ids):
-        if self.num_motions == 1:
-            # Preserve the upstream CPU RNG stream while avoiding one GPU scalar
-            # synchronization per environment.
-            torch.randint(1, (env_ids.shape[0],))
-            return torch.zeros_like(env_ids, device=self.device)
-        return to_torch(
-            [
-                torch.where(
-                    self.obj2motion[env_id % len(self.object_name)] == 1
-                )[0][
-                    torch.randint(
-                        self.obj2motion[
-                            env_id % len(self.object_name)
-                        ].sum(),
-                        (),
-                    )
-                ]
-                for env_id in env_ids
-            ],
-            device=self.device,
-            dtype=torch.long,
-        )
-
-    def _sample_hybrid_motion_times(self, motion_ids, env_ids, ref_init_mask):
-        if self._single_motion_fixed_start:
-            # Upstream draws one CPU uniform for every non-reference reset.
-            # A batched draw advances the CPU RNG by exactly the same amount.
-            torch.rand(int((~ref_init_mask).sum().item()))
-            return torch.zeros_like(env_ids, device=self.device)
-        ref_reset_ids = env_ids[ref_init_mask]
-        return torch.cat(
-            [
-                torch.searchsorted(
-                    self.cal_cdf(motion_ids, row),
-                    torch.rand(1).to(self.device),
-                )
-                if env_ids[row] not in ref_reset_ids
-                else torch.zeros(
-                    (1,), device=self.device, dtype=torch.long
-                )
-                for row in range(env_ids.shape[0])
-            ]
-        )
-
     def _set_env_state(self, env_ids, root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel):
-        device = self._humanoid_root_states.device
-        env_ids = env_ids.to(device)
-        root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel = (
-            value.to(device)
-            for value in (root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel)
-        )
         self._humanoid_root_states[env_ids, 0:3] = root_pos
         self._humanoid_root_states[env_ids, 3:7] = root_rot
         self._humanoid_root_states[env_ids, 7:10] = root_vel
@@ -744,7 +701,7 @@ class InterMimic(Humanoid_SMPLX):
     
     def _compute_observations_iter(self, hoi_data, env_ids=None, delta_t=1):
         if (env_ids is None):
-            env_ids = self._all_env_ids
+            env_ids = to_torch(np.arange(self.num_envs), device=self.device, dtype=torch.long)
 
         ts = self.progress_buf[env_ids].clone() 
         next_ts = torch.clamp(ts + delta_t, max=self.max_episode_length[self.data_id[env_ids]]-1)
@@ -837,13 +794,13 @@ class InterMimic(Humanoid_SMPLX):
                 # Since stateInit is "Start", we average from 1 to curr_steps (skip index 0 which is never computed)
                 if self._max_execution_steps[seq_id] < curr_steps:
                     self._max_execution_steps[seq_id] = curr_steps
-                    # Include the terminal step; index 0 is the unscored initial state.
-                    self._best_human_pose_error_per_seq[seq_id] = self._human_pose_error_per_seq_step[seq_id, 1:curr_steps + 1].mean()
-                    self._best_object_pose_error_per_seq[seq_id] = self._object_pose_error_per_seq_step[seq_id, 1:curr_steps + 1].mean()
+                    # Average from index 1 onwards (index 0 is the initial state, no reward computed)
+                    self._best_human_pose_error_per_seq[seq_id] = self._human_pose_error_per_seq_step[seq_id, 1:curr_steps].mean()
+                    self._best_object_pose_error_per_seq[seq_id] = self._object_pose_error_per_seq_step[seq_id, 1:curr_steps].mean()
                     flag = True
                 elif self._max_execution_steps[seq_id] == curr_steps:
-                    curr_human_error = self._human_pose_error_per_seq_step[seq_id, 1:curr_steps + 1].mean()
-                    curr_object_error = self._object_pose_error_per_seq_step[seq_id, 1:curr_steps + 1].mean()
+                    curr_human_error = self._human_pose_error_per_seq_step[seq_id, 1:curr_steps].mean()
+                    curr_object_error = self._object_pose_error_per_seq_step[seq_id, 1:curr_steps].mean()
                     if self._best_human_pose_error_per_seq[seq_id] + self._best_object_pose_error_per_seq[seq_id] > curr_human_error + curr_object_error:
                         self._best_human_pose_error_per_seq[seq_id] = curr_human_error
                         self._best_object_pose_error_per_seq[seq_id] = curr_object_error
@@ -864,11 +821,7 @@ class InterMimic(Humanoid_SMPLX):
                 print(f'  Success Rate: {success_rate:.2%} ({success_count}/{self.max_episode_length.shape[0]})')
                 print('=' * 60)
 
-        if self.psi > 1 and not self._reference_update_possible:
-            self._sum_reward[self.reset_buf == 1] = 0
-            return
-
-        if self.psi > 1 and self.reset_buf.sum() > 0:
+        if self.reset_buf.sum() > 0 and self.psi > 1:
             reset_ind = (self.reset_buf == 1)
             data_id = self.data_id[reset_ind]
             max_episode_length = self.max_episode_length[data_id]
@@ -876,6 +829,7 @@ class InterMimic(Humanoid_SMPLX):
                 self._sum_reward[reset_ind] = 0
                 return
             start_index, end_index = self.start_times[reset_ind], self.progress_buf[reset_ind]
+            sum_reward = self._sum_reward[reset_ind].mean()
             if torch.rand(1)[0] < 0:
                 self._sum_reward[reset_ind] = 0
                 return
@@ -885,47 +839,35 @@ class InterMimic(Humanoid_SMPLX):
                 return
             curr_reward = self._curr_reward[reset_ind]
             state = self._curr_state[reset_ind]
+            # Initialize the reward tensor with zeros
             reward = torch.zeros((curr_reward.shape[0], self.hoi_refs.shape[0], self.hoi_refs.shape[2]), device=curr_reward.device)
             end_i = torch.minimum(max_episode_length, self.rollout_length + start_index)
 
             assert (end_index < end_i).all()
-            reset_count = curr_reward.shape[0]
-            starts = start_index[:reset_count]
-            ends = end_index[:reset_count]
-            limits = end_i[:reset_count]
-            motions = data_id[:reset_count]
-            frames = torch.arange(reward.shape[2], device=reward.device)
-            frame_grid = frames.unsqueeze(0)
-            valid = (
-                (ends > starts + 30).unsqueeze(1)
-                & (frame_grid >= starts.unsqueeze(1) + 10)
-                & (frame_grid < ends.unsqueeze(1) - 10)
-            )
-            reset_row, frame = torch.where(valid)
-            values = (
-                (ends.unsqueeze(1) - frame_grid)
-                / (limits.unsqueeze(1) - frame_grid)
-            )
-            reward[reset_row, motions[reset_row], frame] = values[reset_row, frame]
+            # Loop through each example in the batch to assign the values from curr_reward to the correct slices in reward
+
+            # data_num, sample_choice, time, feature
+
+            for i in range(curr_reward.shape[0]):
+                if end_index[i] > start_index[i]+30:  # Ensure the indices are valid
+                    index_tensor = torch.arange(start_index[i]+10, end_index[i]-10, device=start_index.device)
+                    reward[i, data_id[i], start_index[i]+10:end_index[i]-10] = ((end_index[i] - index_tensor) / (end_i[i] - index_tensor))
 
             adjust_reward, adjust_reward_index = reward.max(dim=0)
-            _, slot = self.ref_reward[:, 1:, :].min(dim=1)
-            slot = slot + 1
-            frame_grid = frames.unsqueeze(0).expand(reward.shape[1], -1)
-            winner_start = starts[adjust_reward_index]
-            state_frame = frame_grid - winner_start
-            valid = (
-                (self.max_episode_length.unsqueeze(1) - frame_grid >= self.rollout_length)
-                & (state_frame > 0)
-                & (state_frame < self.rollout_length)
-                & (adjust_reward > 0.5)
-            )
-            motion, frame = torch.where(valid)
-            target_slot = slot[motion, frame]
-            winner = adjust_reward_index[motion, frame]
-            source_frame = state_frame[motion, frame]
-            self.ref_reward[motion, target_slot, frame] = adjust_reward[motion, frame]
-            self.hoi_refs[motion, target_slot, frame] = state[winner, source_frame]
+            for i in range(reward.shape[1]):
+                if self.max_episode_length[i] < self.rollout_length:
+                    continue
+                for j in range(reward.shape[2]):
+                    if self.max_episode_length[i] - j < self.rollout_length:
+                        break
+                    value, index = self.ref_reward[i, 1:, j].min(dim=0)
+                    index = index + 1
+                    id1 = adjust_reward_index[i, j]
+                    idx = j - start_index[adjust_reward_index[i, j]]
+
+                    if idx > 0 and idx < self.rollout_length and adjust_reward[i, j] > 0.5:
+                        self.ref_reward[i, index, j] = adjust_reward[i, j]
+                        self.hoi_refs[i, index, j] = state[id1, idx]
             self.ref_reward[:, 1:, :] = self.ref_reward[:, 1:, :] * (1 - 1e-5)
         return
 
@@ -937,14 +879,8 @@ class InterMimic(Humanoid_SMPLX):
                                                         max_episode_length, enable_early_termination, termination_heights, 
                                                         start_times, rollout_length)
 
-        grace_steps = (
-            1
-            if self._termination_grace_steps is None
-            else self._termination_grace_steps
-        )
-        past_grace = progress_buf > grace_steps + start_times
-        reset_ig *= past_grace
-        contact_reset *= past_grace
+        reset_ig *= (progress_buf > 1 + start_times)
+        contact_reset *= (progress_buf > 1 + start_times)
                 
         terminated = torch.where(torch.logical_or(reset_ig, contact_reset), torch.ones_like(reset_buf), terminated)
         reset = torch.where(reset.bool(), torch.ones_like(reset_buf), terminated)
@@ -957,16 +893,10 @@ class InterMimic(Humanoid_SMPLX):
         rig, ig_reset = self.compute_ig_reward(self.reward_weights, key_pos, ref_key_pos, obj_points, ref_obj_points)
         rcg, contact_reset = self.compute_cg_reward(self.reward_weights)
         self.rew_buf[:] = rb * ro * rig * rcg
-        if self._termination_grace_steps is not None:
-            past_grace = (
-                self.progress_buf
-                > self._termination_grace_steps + self.start_times
-            )
-            contact_reset *= past_grace.unsqueeze(-1)
         kinematic_reset = torch.logical_or(human_reset, object_reset)
         self.contact_reset = (self.contact_reset + contact_reset) * contact_reset
         self.kinematic_reset = torch.logical_or(ig_reset, kinematic_reset)
-        index = self._all_env_ids
+        index = torch.arange(self._curr_reward.shape[0])
         # # print(self._humanoid_root_states.dtype)
         self._curr_reward[index, self.progress_buf - self.start_times] = self.rew_buf
         self._sum_reward[index] += self.rew_buf
@@ -1275,96 +1205,48 @@ class InterMimic(Humanoid_SMPLX):
                 self.gym.write_viewer_image_to_file(self.viewer, str(rgb_filename))
         return
 
-    def evaluation_complete(self):
-        """Return whether every native evaluation motion has produced a result."""
-
-        return self.enable_evaluation and bool((self._max_execution_steps >= 1).all().item())
-
-    def evaluation_report(self):
-        """Return the complete native evaluation result in natural groups."""
-
+    def print_final_eval_summary(self):
+        """Print final evaluation summary at the end of inference"""
         if not self.enable_evaluation:
-            raise RuntimeError("InterMimic evaluation is not enabled")
+            return
+
         evaluated_mask = self._max_execution_steps >= 1
-        evaluated_count = int(evaluated_mask.sum().item())
-        success_mask = evaluated_mask & (
-            self._max_execution_steps >= self.max_episode_length - 1
-        )
-        success_count = int(success_mask.sum().item())
+        num_evaluated = evaluated_mask.sum()
 
-        if evaluated_count:
-            average_execution_steps = float(
-                self._max_execution_steps[evaluated_mask].float().mean().item()
-            )
-            average_human_error = float(
-                self._best_human_pose_error_per_seq[evaluated_mask].mean().item()
-            )
-            average_object_error = float(
-                self._best_object_pose_error_per_seq[evaluated_mask].mean().item()
-            )
-        else:
-            average_execution_steps = None
-            average_human_error = None
-            average_object_error = None
+        if num_evaluated == 0:
+            print("=" * 60)
+            print("WARNING: No sequences were evaluated!")
+            print("Consider increasing --max_steps in the evaluation script")
+            print("=" * 60)
+            return
 
-        motions = []
-        for motion_id in range(self.num_motions):
-            evaluated = bool(evaluated_mask[motion_id].item())
-            object_id = int(self.object_id[motion_id].item())
-            motions.append(
-                {
-                    "motion_id": motion_id,
-                    "motion_file": self.motion_file[motion_id],
-                    "dataset_id": int(self.dataset_index[motion_id].item()),
-                    "object": self.object_name[object_id],
-                    "visits": int(self._sequence_visit_count[motion_id].item()),
-                    "evaluated": evaluated,
-                    "execution_steps": int(self._max_execution_steps[motion_id].item()),
-                    "success": bool(success_mask[motion_id].item()),
-                    "human_pose_error": float(
-                        self._best_human_pose_error_per_seq[motion_id].item()
-                    ) if evaluated else None,
-                    "object_pose_error": float(
-                        self._best_object_pose_error_per_seq[motion_id].item()
-                    ) if evaluated else None,
-                }
-            )
+        avg_execution_steps = self._max_execution_steps[evaluated_mask].float().mean()
+        avg_human_error = self._best_human_pose_error_per_seq[evaluated_mask].mean()
+        avg_object_error = self._best_object_pose_error_per_seq[evaluated_mask].mean()
+        success_count = torch.sum(self._max_execution_steps[evaluated_mask] - (self.max_episode_length[evaluated_mask] - 1) >= 0)
+        success_rate = success_count.float() / num_evaluated
 
-        missing_motion_ids = [
-            motion["motion_id"] for motion in motions if not motion["evaluated"]
-        ]
-        report = {
-            "coverage": {
-                "total": self.num_motions,
-                "evaluated": evaluated_count,
-                "missing_motion_ids": missing_motion_ids,
-                "complete": not missing_motion_ids,
-            },
-            "success": {
-                "count": success_count,
-                "denominator": self.num_motions,
-                "rate": success_count / self.num_motions,
-            },
-            "metrics": {
-                "aggregation": "evaluated_only",
-                "evaluated_count": evaluated_count,
-                "average_execution_steps": average_execution_steps,
-                "average_human_pose_error": average_human_error,
-                "average_object_pose_error": average_object_error,
-            },
-            "motions": motions,
-        }
-        validate_evaluation_report(report)
-        return report
+        # Visit statistics
+        min_visits = self._sequence_visit_count.min().item()
+        max_visits = self._sequence_visit_count.max().item()
+        avg_visits = self._sequence_visit_count.float().mean().item()
 
+        print("\n" + "=" * 60)
+        print("FINAL EVALUATION SUMMARY:")
+        print(f"  Sequences Evaluated: {num_evaluated}/{self.num_motions} ({100.0 * num_evaluated / self.num_motions:.1f}%)")
+        print(f"  Sequence Visits - Min: {min_visits}, Max: {max_visits}, Avg: {avg_visits:.1f}")
+        print(f"  Average Execution Steps: {avg_execution_steps:.2f}")
+        print(f"  Average Human Pose Error: {avg_human_error:.4f}")
+        print(f"  Average Object Pose Error: {avg_object_error:.4f}")
+        print(f"  Success Rate: {success_rate:.2%} ({success_count}/{num_evaluated})")
+        print("=" * 60 + "\n")
+    
 @torch.jit.script
 def compute_sdf(points1, points2):
     # type: (Tensor, Tensor) -> Tensor
     dis_mat = points1.unsqueeze(2) - points2.unsqueeze(1)
     dis_mat_lengths = torch.norm(dis_mat, dim=-1)
     min_length_indices = torch.argmin(dis_mat_lengths, dim=-1)
-    gather_index = min_length_indices.unsqueeze(-1).unsqueeze(-1).expand(
-        -1, -1, 1, dis_mat.shape[-1]
-    )
-    min_dis_mat = dis_mat.gather(2, gather_index).squeeze(2).contiguous()
+    B_indices, N_indices = torch.meshgrid(torch.arange(points1.shape[0]), torch.arange(points1.shape[1]), indexing='ij')
+    min_dis_mat = dis_mat[B_indices, N_indices, min_length_indices].contiguous()
     return min_dis_mat
