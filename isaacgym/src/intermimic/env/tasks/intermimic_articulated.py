@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from .intermimic import InterMimic, compute_sdf
-from isaacgym.torch_utils import to_torch
+from isaacgym.torch_utils import quat_mul, to_torch
 from ...utils import torch_utils
 
 
@@ -69,105 +69,6 @@ def _target_region_contact_reward(
     )
     hand_error = (intended_contact & ~live_target_contact).to(dtype=distance.dtype)
     return hand_reward, hand_error, live_target_contact
-
-
-def _opposing_contact_power_reward(
-    *,
-    intended,
-    distance,
-    hand_force,
-    region_force,
-    region_force_vector,
-    reference_point_velocity,
-    point_link_ids,
-    distance_threshold,
-    force_threshold,
-    power_scale,
-    positive_margin,
-    error_scale,
-    reward_floor,
-):
-    """Reward same-link contact power up to a small positive margin."""
-
-    if intended.shape != hand_force.shape or intended.ndim != 2:
-        raise ValueError("intended and hand_force must share shape (envs, hands)")
-    if distance.ndim != 3 or distance.shape[:2] != intended.shape:
-        raise ValueError("distance must have shape (envs, hands, target_links)")
-    link_count = int(distance.shape[2])
-    if region_force.shape != (intended.shape[0], link_count):
-        raise ValueError("region_force must have shape (envs, target_links)")
-    if region_force_vector.shape != (intended.shape[0], link_count, 3):
-        raise ValueError(
-            "region_force_vector must have shape (envs, target_links, 3)"
-        )
-    if (
-        reference_point_velocity.ndim != 3
-        or reference_point_velocity.shape[0] != intended.shape[0]
-        or reference_point_velocity.shape[2] != 3
-    ):
-        raise ValueError(
-            "reference_point_velocity must have shape (envs, points, 3)"
-        )
-    if point_link_ids.shape != (reference_point_velocity.shape[1],):
-        raise ValueError("point_link_ids must contain one target-link id per point")
-    if (
-        power_scale <= 0.0
-        or not torch.isfinite(torch.as_tensor(positive_margin)).item()
-        or positive_margin < 0.0
-        or error_scale < 0.0
-    ):
-        raise ValueError(
-            "power_scale must be positive; positive_margin and error_scale "
-            "must be finite and nonnegative"
-        )
-    if reward_floor < 0.0 or reward_floor > 1.0:
-        raise ValueError("reward_floor must be in [0, 1]")
-
-    same_link = (
-        (intended > 0.1)[:, :, None]
-        & (distance <= distance_threshold)
-        & (hand_force >= force_threshold)[:, :, None]
-        & (region_force >= force_threshold)[:, None, :]
-    )
-    active_link = torch.any(same_link, dim=1)
-    force_by_point = region_force_vector[:, point_link_ids]
-    point_power = torch.sum(
-        force_by_point * reference_point_velocity,
-        dim=-1,
-    )
-    conservative_link_power = []
-    for link_index in range(link_count):
-        link_points = point_power[:, point_link_ids == link_index]
-        if link_points.shape[1] == 0:
-            raise ValueError("Every target link must own at least one region point")
-        conservative_link_power.append(link_points.amax(dim=1))
-    conservative_link_power = torch.stack(conservative_link_power, dim=1)
-    active_count = active_link.sum(dim=1)
-    conservative_power = torch.sum(
-        torch.where(
-            active_link,
-            conservative_link_power,
-            torch.zeros_like(conservative_link_power),
-        ),
-        dim=1,
-    ) / torch.clamp(active_count, min=1)
-    power_error = torch.relu(
-        (float(positive_margin) - conservative_power) / float(power_scale)
-    ).pow(2)
-    shaped_reward = float(reward_floor) + (
-        1.0 - float(reward_floor)
-    ) * torch.exp(-float(error_scale) * power_error)
-    requires_power = torch.any(intended > 0.1, dim=1)
-    reward = torch.where(
-        requires_power,
-        torch.where(
-            active_count > 0,
-            shaped_reward,
-            torch.full_like(power_error, float(reward_floor)),
-        ),
-        torch.ones_like(power_error),
-    )
-    return reward, conservative_power, active_link
 
 
 def _initial_object_reset_state(
@@ -253,7 +154,25 @@ class InterMimicArticulated(InterMimic):
         with np.load(object_reference_path, allow_pickle=False) as values:
             object_root_pos = np.asarray(values["object_root_pos"], dtype=np.float32)
             object_root_rot = np.asarray(values["object_root_rot_xyzw"], dtype=np.float32)
+            object_root_vel = np.asarray(
+                values["object_root_vel"], dtype=np.float32
+            )
+            object_root_ang_vel = np.asarray(
+                values["object_root_ang_vel"], dtype=np.float32
+            )
+            self._root_reference_np = np.concatenate(
+                (
+                    object_root_pos,
+                    object_root_rot,
+                    object_root_vel,
+                    object_root_ang_vel,
+                ),
+                axis=1,
+            )
             self._q_reference_np = np.asarray(values["object_joint_qpos"], dtype=np.float32)
+            self._qvel_reference_np = np.asarray(
+                values["object_joint_qvel"], dtype=np.float32
+            )
             self._joint_types = [
                 str(value) for value in np.asarray(values["joint_types"]).tolist()
             ]
@@ -276,6 +195,12 @@ class InterMimicArticulated(InterMimic):
             self._link_reference_rot_np = np.asarray(
                 values["object_link_rot_xyzw"], dtype=np.float32
             )
+            self._link_reference_vel_np = np.asarray(
+                values["object_link_vel"], dtype=np.float32
+            )
+            self._link_reference_ang_vel_np = np.asarray(
+                values["object_link_ang_vel"], dtype=np.float32
+            )
             self._reference_link_names = [
                 str(value) for value in np.asarray(values["body_names"]).tolist()
             ]
@@ -292,8 +217,24 @@ class InterMimicArticulated(InterMimic):
                 for value in np.asarray(values["contact_region_link_names"]).tolist()
             ]
             self._reference_fps = float(np.asarray(values["fps"]).item())
-            parent_points = np.asarray(values["active_parent_points"], dtype=np.float32)
-            child_points = np.asarray(values["active_child_points"], dtype=np.float32)
+            self._active_surface_points_np = np.asarray(
+                values["active_surface_points_link_local_scaled"], dtype=np.float32
+            )
+            self._active_surface_link_names = [
+                str(value)
+                for value in np.asarray(
+                    values["active_surface_point_link_names"]
+                ).tolist()
+            ]
+            self._full_surface_points_np = np.asarray(
+                values["full_surface_points_link_local_scaled"], dtype=np.float32
+            )
+            self._full_surface_link_names = [
+                str(value)
+                for value in np.asarray(
+                    values["full_surface_point_link_names"]
+                ).tolist()
+            ]
         self._object_creation_pos_np, self._object_creation_rot_np = _object_creation_pose(
             object_root_pos, object_root_rot
         )
@@ -302,10 +243,6 @@ class InterMimicArticulated(InterMimic):
         self._active_joint_names = [
             str(value) for value in self._object_config["active_joint_names"]
         ]
-        self._active_dof_ids_np = np.asarray(
-            [self._joint_names.index(name) for name in self._active_joint_names],
-            dtype=np.int64,
-        )
         self._initial_qpos_np = np.asarray(
             self._object_config["initial_joint_qpos"],
             dtype=np.float32,
@@ -317,11 +254,15 @@ class InterMimicArticulated(InterMimic):
             raise ValueError("initial_joint_qpos must be finite and match object joints")
         self._initial_qvel_np = np.zeros_like(self._initial_qpos_np)
         self._object_dof_count = len(self._joint_names)
-        self._active_dof_count = len(self._active_joint_names)
         self._active_link_names = [
             str(value)
             for value in self._object_config["active_child_link_names"]
         ]
+        if len(self._active_link_names) != 1:
+            raise ValueError(
+                "InterMimic's fixed-width 21-D object tracking supports exactly "
+                "one active task link; the shared scene still simulates every joint"
+            )
         if (
             reference_joint_names != self._joint_names
             or self._joint_types
@@ -337,58 +278,12 @@ class InterMimicArticulated(InterMimic):
             != [str(value) for value in self._object_config["body_names"]]
         ):
             raise ValueError("Articulated manifest and reference topology disagree")
-        self._observation_variant = env["articulationObservation"]
-        if self._observation_variant not in {
-            "rigid_graph",
-            "articulated_graph",
-            "joint_state",
-            "articulated_graph_joint_state",
-        }:
+        self._surface_mode = str(env["intermimicSurface"])
+        if self._surface_mode not in {"active_link", "full_object"}:
             raise ValueError(
-                f"Unknown articulation observation: {self._observation_variant}"
-        )
-        self._use_articulated_graph = (
-            self._active_dof_count > 0
-            and self._observation_variant
-            in {"articulated_graph", "articulated_graph_joint_state"}
-        )
-        self._use_joint_state = (
-            self._active_dof_count > 0
-            and self._observation_variant
-            in {"joint_state", "articulated_graph_joint_state"}
-        )
-        qvel_scale = np.asarray(
-            env["articulationQvelScale"], dtype=np.float32
-        ).reshape(-1)
-        if qvel_scale.size == 1:
-            qvel_scale = np.repeat(qvel_scale, self._active_dof_count)
-        if qvel_scale.shape != (self._active_dof_count,):
-            raise ValueError(
-                "articulationQvelScale must be scalar or match active object DOFs, got "
-                f"{qvel_scale.shape} for {self._active_dof_count} active DOFs"
+                "intermimicSurface must be 'active_link' or 'full_object', got "
+                f"{self._surface_mode!r}"
             )
-        if not np.all(np.isfinite(qvel_scale)) or np.any(qvel_scale <= 0):
-            raise ValueError("articulationQvelScale must contain finite positive values")
-        self._qvel_scale_np = qvel_scale
-        self._contact_power_scale = float(env["articulationContactPowerScale"])
-        self._contact_power_margin = float(
-            env["articulationContactPowerMargin"]
-        )
-        if (
-            not np.isfinite(self._contact_power_scale)
-            or self._contact_power_scale <= 0.0
-        ):
-            raise ValueError("articulationContactPowerScale must be positive finite")
-        if (
-            not np.isfinite(self._contact_power_margin)
-            or self._contact_power_margin < 0.0
-        ):
-            raise ValueError(
-                "articulationContactPowerMargin must be nonnegative finite"
-            )
-        self._native_obs_size = int(env["numObs"])
-        if self._use_joint_state:
-            env["numObs"] = self._native_obs_size + 4 * self._active_dof_count
         if (
             self._q_reference_np.ndim != 2
             or self._q_reference_np.shape[1] != self._object_dof_count
@@ -415,8 +310,26 @@ class InterMimicArticulated(InterMimic):
                 "object_link_rot_xyzw must have shape (frames, links, 4), got "
                 f"{self._link_reference_rot_np.shape}"
             )
+        expected_link_velocity_shape = self._link_reference_np.shape
+        if (
+            self._link_reference_vel_np.shape != expected_link_velocity_shape
+            or self._link_reference_ang_vel_np.shape != expected_link_velocity_shape
+            or not np.isfinite(self._link_reference_vel_np).all()
+            or not np.isfinite(self._link_reference_ang_vel_np).all()
+        ):
+            raise ValueError("Object link velocity references must match link positions")
         if not np.all(np.isfinite(self._q_reference_np)):
             raise ValueError("Object q reference must be finite")
+        if (
+            self._root_reference_np.shape != (self._q_reference_np.shape[0], 13)
+            or not np.isfinite(self._root_reference_np).all()
+        ):
+            raise ValueError("Object root reference must be finite and match the joint timeline")
+        if (
+            self._qvel_reference_np.shape != self._q_reference_np.shape
+            or not np.all(np.isfinite(self._qvel_reference_np))
+        ):
+            raise ValueError("Object qvel reference must match object q reference")
         if self._intended_contact_np.shape != (self._q_reference_np.shape[0], 2):
             raise ValueError("intended contact must have shape (frames, 2)")
         if self._contact_points_np.shape != (len(self._contact_point_link_names), 3):
@@ -429,10 +342,24 @@ class InterMimicArticulated(InterMimic):
             != set(self._contact_region_link_names)
         ):
             raise ValueError("Canonical contact-region names and points disagree")
-        self._object_points_np = np.concatenate(
-            (parent_points.reshape(-1, 3), child_points.reshape(-1, 3)),
-            axis=0,
-        )
+        for points, names, label in (
+            (
+                self._active_surface_points_np,
+                self._active_surface_link_names,
+                "active",
+            ),
+            (
+                self._full_surface_points_np,
+                self._full_surface_link_names,
+                "full",
+            ),
+        ):
+            if points.shape != (1024, 3) or len(names) != 1024:
+                raise ValueError(
+                    f"{label} interaction surface must contain exactly 1,024 points"
+                )
+            if not np.isfinite(points).all():
+                raise ValueError(f"{label} interaction surface must be finite")
         self._configure_articulated_actor = configure_articulated_actor
         self._create_static_box_actors = create_static_box_actors
         self._load_articulated_asset = load_articulated_asset
@@ -440,28 +367,6 @@ class InterMimicArticulated(InterMimic):
         self._CommonRolloutRecorder = CommonRolloutRecorder
         self._common_human_body_names = SMPLX_BODY_NAMES
 
-        self._q_reward_weight = env["articulationRewardWeight"]
-        self._qvel_reward_weight = env["articulationQvelRewardWeight"]
-        self._opposing_contact_power_reward_weight = env[
-            "articulationOpposingContactPowerRewardWeight"
-        ]
-        self._link_reward_weight = env["articulationLinkRewardWeight"]
-        self._q_reward_scale = env["articulationRewardScale"]
-        self._qvel_reward_scale = env["articulationQvelRewardScale"]
-        self._opposing_contact_power_reward_scale = env[
-            "articulationOpposingContactPowerRewardScale"
-        ]
-        self._opposing_contact_power_reward_floor = env[
-            "articulationOpposingContactPowerRewardFloor"
-        ]
-        if (
-            self._opposing_contact_power_reward_floor < 0.0
-            or self._opposing_contact_power_reward_floor > 1.0
-        ):
-            raise ValueError(
-                "articulationOpposingContactPowerRewardFloor must be in [0, 1]"
-            )
-        self._link_reward_scale = env["articulationLinkRewardScale"]
         self._target_contact_distance_threshold = float(
             env["articulationContactDistanceThreshold"]
         )
@@ -501,32 +406,36 @@ class InterMimicArticulated(InterMimic):
         self._q_reference = None
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
         self._q_reference = torch.as_tensor(self._q_reference_np, device=self.device)
+        self._qvel_reference = torch.as_tensor(
+            self._qvel_reference_np,
+            device=self.device,
+        )
+        self._root_reference = torch.as_tensor(
+            self._root_reference_np,
+            device=self.device,
+        )
         self._link_reference = torch.as_tensor(self._link_reference_np, device=self.device)
         self._link_reference_rot = torch.as_tensor(
             self._link_reference_rot_np, device=self.device
         )
-        self._intended_contact = torch.as_tensor(self._intended_contact_np, device=self.device)
-        self._active_dof_ids = torch.as_tensor(
-            self._active_dof_ids_np,
-            device=self.device,
-            dtype=torch.long,
+        self._link_reference_vel = torch.as_tensor(
+            self._link_reference_vel_np, device=self.device
         )
-        lower = np.asarray(self._target_dof_properties["lower"], dtype=np.float32)
-        upper = np.asarray(self._target_dof_properties["upper"], dtype=np.float32)
-        active_lower = lower[self._active_dof_ids_np]
-        active_range = (upper - lower)[self._active_dof_ids_np]
-        if self._active_dof_count and (
-            not np.all(np.isfinite(active_range)) or np.any(active_range <= 0)
-        ):
-            raise ValueError("Active object DOFs require finite positive joint ranges")
-        self._q_lower = torch.as_tensor(active_lower, device=self.device)
-        self._q_range = torch.as_tensor(active_range, device=self.device)
-        self._qvel_scale = torch.as_tensor(self._qvel_scale_np, device=self.device)
+        self._link_reference_ang_vel = torch.as_tensor(
+            self._link_reference_ang_vel_np, device=self.device
+        )
+        self._intended_contact = torch.as_tensor(self._intended_contact_np, device=self.device)
         if self._rollout_path:
             self._rollout_terminated = torch.zeros(
                 self.num_envs, device=self.device, dtype=torch.bool
             )
         self._resolve_rollout_body_indices()
+        self._previous_active_link_vel = torch.zeros(
+            self.num_envs, 3, device=self.device
+        )
+        self._previous_active_link_ang_vel = torch.zeros_like(
+            self._previous_active_link_vel
+        )
         if self._rollout_path:
             if self.num_envs != 1:
                 raise ValueError("common rollout recording requires exactly one environment")
@@ -561,7 +470,7 @@ class InterMimicArticulated(InterMimic):
             self.gym.get_asset_rigid_shape_count(asset) + len(self._static_box_assets)
         )
         self.object_points = torch.as_tensor(
-            self._object_points_np[None],
+            self._active_surface_points_np[None],
             device=self.device,
         )
 
@@ -637,13 +546,32 @@ class InterMimicArticulated(InterMimic):
         self._tar_contact_forces = self._target_contact_forces.sum(dim=1)
 
     def _reset_target(self, env_ids):
-        super()._reset_target(env_ids)
-        reset_qpos, reset_qvel = _initial_object_reset_state(
-            to_torch(self._initial_qpos_np, device=self.device),
-            self.progress_buf[env_ids],
+        frames = torch.clamp(
+            self.progress_buf[env_ids].long(),
+            0,
+            self._q_reference_np.shape[0] - 1,
         )
+        self._target_states[env_ids] = self._root_reference[frames]
+        if self._state_init in {
+            InterMimic.StateInit.Default,
+            InterMimic.StateInit.Start,
+        }:
+            reset_qpos, reset_qvel = _initial_object_reset_state(
+                to_torch(self._initial_qpos_np, device=self.device),
+                env_ids,
+            )
+        else:
+            reset_qpos = self._q_reference[frames]
+            reset_qvel = self._qvel_reference[frames]
         self._target_dof_pos[env_ids] = reset_qpos
         self._target_dof_vel[env_ids] = reset_qvel
+        if hasattr(self, "_previous_active_link_vel"):
+            self._previous_active_link_vel[env_ids] = self._link_reference_vel[
+                frames, self._active_reference_link_id
+            ]
+            self._previous_active_link_ang_vel[env_ids] = (
+                self._link_reference_ang_vel[frames, self._active_reference_link_id]
+            )
         if self._rollout_terminated is not None:
             self._rollout_terminated[env_ids] = False
 
@@ -775,13 +703,9 @@ class InterMimicArticulated(InterMimic):
             ),
             dim=-1,
         )
-        if self._use_joint_state:
-            native = torch.cat((native, self._joint_state_observation(env_ids)), dim=-1)
         self.obs_buf[env_ids] = native
 
     def _compute_observations_iter(self, hoi_data, env_ids=None, delta_t=1):
-        if not self._use_articulated_graph:
-            return super()._compute_observations_iter(hoi_data, env_ids, delta_t)
         if env_ids is None:
             env_ids = to_torch(
                 np.arange(self.num_envs), device=self.device, dtype=torch.long
@@ -795,7 +719,7 @@ class InterMimicArticulated(InterMimic):
         obs = torch.cat(
             (
                 self._compute_humanoid_obs(env_ids, ref_obs, next_ts),
-                self._compute_task_obs(env_ids, ref_obs),
+                self._active_link_tracking_observation(env_ids, next_ts),
             ),
             dim=-1,
         )
@@ -804,50 +728,84 @@ class InterMimicArticulated(InterMimic):
         )
         return torch.cat((obs, ig_all, ref_ig - ig), dim=-1)
 
-    def _joint_state_observation(self, env_ids):
-        if self._active_dof_count == 0:
-            return self._target_dof_pos[env_ids, :0]
+    def _active_link_tracking_observation(self, env_ids, reference_frames):
+        """Replace the author 21-D rigid-root feature with one active link."""
 
-        q = self._target_dof_pos[env_ids][:, self._active_dof_ids]
-        qvel = self._target_dof_vel[env_ids][:, self._active_dof_ids]
-        frame = self.progress_buf[env_ids]
-        frame_1 = torch.clamp(frame + 1, max=self._q_reference.shape[0] - 1)
-        frame_16 = torch.clamp(frame + 16, max=self._q_reference.shape[0] - 1)
-        normalized_q = 2.0 * (q - self._q_lower) / self._q_range - 1.0
+        root_states = self._humanoid_root_states[env_ids]
+        root_pos = root_states[:, :3]
+        root_rot = root_states[:, 3:7]
+        live = self._target_body_state[env_ids, self._active_body_id]
+        reference_pos = self._link_reference[
+            reference_frames, self._active_reference_link_id
+        ]
+        reference_rot = self._link_reference_rot[
+            reference_frames, self._active_reference_link_id
+        ]
+        reference_vel = self._link_reference_vel[
+            reference_frames, self._active_reference_link_id
+        ]
+        reference_ang_vel = self._link_reference_ang_vel[
+            reference_frames, self._active_reference_link_id
+        ]
+
+        heading = torch_utils.calc_heading_quat_inv(root_rot)
+        heading_inv = torch_utils.calc_heading_quat(root_rot)
+        local_vel = torch_utils.quat_rotate(heading, live[:, 7:10])
+        local_ang_vel = torch_utils.quat_rotate(heading, live[:, 10:13])
+        position_error = reference_pos - live[:, :3]
+        local_position_error = torch_utils.quat_rotate(heading, position_error)
+
+        rotation_error = torch_utils.quat_mul_norm(
+            torch_utils.quat_inverse(reference_rot), live[:, 3:7]
+        )
+        local_rotation_error = quat_mul(
+            quat_mul(heading, rotation_error), heading_inv
+        )
+        local_rotation_error = torch_utils.quat_to_tan_norm(local_rotation_error)
+        local_velocity_error = torch_utils.quat_rotate(
+            heading, reference_vel - live[:, 7:10]
+        )
+        local_angular_velocity_error = torch_utils.quat_rotate(
+            heading, reference_ang_vel - live[:, 10:13]
+        )
         return torch.cat(
             (
-                normalized_q,
-                qvel / self._qvel_scale,
-                (
-                    self._q_reference[frame_1][:, self._active_dof_ids] - q
-                ) / self._q_range,
-                (
-                    self._q_reference[frame_16][:, self._active_dof_ids] - q
-                ) / self._q_range,
+                local_vel,
+                local_ang_vel,
+                local_position_error,
+                local_rotation_error,
+                local_velocity_error,
+                local_angular_velocity_error,
             ),
             dim=-1,
         )
 
-    def _articulated_graph_observation(self, env_ids, ref_obs, next_ts):
-        live_state = self._target_body_state[env_ids][
-            :, self._contact_point_body_ids
-        ]
-        local_points = self._contact_points.unsqueeze(0).expand(
-            len(env_ids), -1, -1
-        )
-        live_points = torch_utils.quat_rotate(
-            live_state[..., 3:7].reshape(-1, 4), local_points.reshape(-1, 3)
-        ).view(len(env_ids), -1, 3) + live_state[..., :3]
+    def _surface_points(self, state, local_points, body_ids):
+        point_state = state[:, body_ids]
+        points = local_points.unsqueeze(0).expand(len(state), -1, -1)
+        return torch_utils.quat_rotate(
+            point_state[..., 3:7].reshape(-1, 4), points.reshape(-1, 3)
+        ).view(len(state), -1, 3) + point_state[..., :3]
 
-        ref_pos = self._link_reference[next_ts][
-            :, self._graph_reference_link_ids
-        ]
-        ref_rot = self._link_reference_rot[next_ts][
-            :, self._graph_reference_link_ids
-        ]
-        ref_points = torch_utils.quat_rotate(
-            ref_rot.reshape(-1, 4), local_points.reshape(-1, 3)
-        ).view(len(env_ids), -1, 3) + ref_pos
+    def _reference_surface_points(self, frames, local_points, reference_link_ids):
+        positions = self._link_reference[frames][:, reference_link_ids]
+        rotations = self._link_reference_rot[frames][:, reference_link_ids]
+        points = local_points.unsqueeze(0).expand(len(frames), -1, -1)
+        return torch_utils.quat_rotate(
+            rotations.reshape(-1, 4), points.reshape(-1, 3)
+        ).view(len(frames), -1, 3) + positions
+
+    def _articulated_graph_observation(self, env_ids, ref_obs, next_ts):
+        live_points = self._surface_points(
+            self._target_body_state[env_ids],
+            self._graph_surface_points,
+            self._graph_body_ids,
+        )
+        ref_points = self._reference_surface_points(
+            next_ts,
+            self._graph_surface_points,
+            self._graph_reference_link_ids,
+        )
 
         live_ig = self._encode_graph(
             self._rigid_body_pos[env_ids],
@@ -877,6 +835,110 @@ class InterMimicArticulated(InterMimic):
         norm = torch.linalg.norm(graph, dim=-1, keepdim=True)
         return graph / (norm + 1e-6) * torch.exp(-5.0 * norm)
 
+    def _reference_human_interaction_graph(self):
+        """Use the selected articulated surface in the unchanged human reward."""
+
+        frames = self._reference_frame()
+        body_pos = self.extract_data_component(
+            "body_pos", obs=self._curr_ref_obs
+        ).view(self.num_envs, -1, 3)
+        object_points = self._reference_surface_points(
+            frames,
+            self._graph_surface_points,
+            self._graph_reference_link_ids,
+        )
+        graph = compute_sdf(body_pos, object_points)
+        heading = torch_utils.calc_heading_quat_inv(
+            self.extract_data_component("root_rot", obs=self._curr_ref_obs)
+        )
+        return torch_utils.quat_rotate(
+            heading.unsqueeze(1).expand(-1, body_pos.shape[1], -1).reshape(-1, 4),
+            graph.reshape(-1, 3),
+        ).view_as(graph)
+
+    def compute_humanoid_reward(self, weights):
+        """Keep the author formula, replacing only its rigid reference surface."""
+
+        key_count = len(self._key_body_ids)
+        key_pos = self.extract_data_component(
+            "body_pos", obs=self._curr_obs
+        ).view(self.num_envs, -1, 3)[:, self._key_body_ids]
+        ref_key_pos = self.extract_data_component(
+            "body_pos", obs=self._curr_ref_obs
+        ).view(self.num_envs, -1, 3)[:, self._key_body_ids]
+        reference_ig = self._reference_human_interaction_graph()
+        weight_h = (-5.0 * reference_ig.norm(dim=-1)).exp()
+        weight_hp = weight_h.clone().detach()
+        ankle_toe_ids = [
+            index
+            for index in range(key_count)
+            if "Ankle" in self.key_bodies[index] or "Toe" in self.key_bodies[index]
+        ]
+        weight_hp[:, ankle_toe_ids] = 1.0
+
+        position_error = torch.mean(
+            (ref_key_pos - key_pos).square().sum(dim=-1)
+            * weight_hp[:, self._key_body_ids],
+            dim=-1,
+        )
+        position_reward = torch.exp(-position_error * weights["p"])
+
+        body_rot = self.extract_data_component(
+            "body_rot", obs=self._curr_obs
+        ).view(self.num_envs, -1, 4)
+        reference_body_rot = self.extract_data_component(
+            "body_rot", obs=self._curr_ref_obs
+        ).view(self.num_envs, -1, 4)
+        difference = torch_utils.quat_mul_norm(
+            torch_utils.quat_inverse(reference_body_rot.reshape(-1, 4)),
+            body_rot.reshape(-1, 4),
+        )
+        angle, _ = torch_utils.quat_to_angle_axis(difference)
+        rotation_error = torch.mean(
+            angle.view(-1, 52) * (1.0 - weight_h), dim=-1
+        )
+        rotation_reward = torch.exp(-rotation_error * weights["r"])
+
+        body_velocity_error = torch.mean(
+            (
+                self.extract_data_component("body_pos_vel", obs=self._curr_ref_obs)
+                - self.extract_data_component("body_pos_vel", obs=self._curr_obs)
+            ).square(),
+            dim=-1,
+        )
+        body_velocity_reward = torch.exp(-body_velocity_error * weights["pv"])
+        rotation_velocity_error = torch.mean(
+            (
+                self.extract_data_component("body_rot_vel", obs=self._curr_ref_obs)
+                - self.extract_data_component("body_rot_vel", obs=self._curr_obs)
+            ).square(),
+            dim=-1,
+        )
+        rotation_velocity_reward = torch.exp(
+            -rotation_velocity_error * weights["rv"]
+        )
+
+        dof_acceleration = (
+            self.extract_data_component("dof_vel", obs=self._curr_obs)
+            - self.extract_data_component("dof_vel", obs=self._hist_obs)
+        ) * self.fps_data
+        dof_acceleration *= (
+            self.progress_buf - self.start_times > 2
+        ).float().unsqueeze(-1)
+        energy_reward = torch.exp(
+            -dof_acceleration.view(-1, 51 * 3).square().mean(dim=-1)
+            * weights["eg1"]
+        )
+        reward = (
+            position_reward
+            * rotation_reward
+            * body_velocity_reward
+            * rotation_velocity_reward
+            * energy_reward
+        )
+        reset = (ref_key_pos - key_pos).norm(dim=-1).mean(dim=-1) > 0.5
+        return reward, reset, key_pos, ref_key_pos
+
     def _compute_reset(self):
         super()._compute_reset()
         if not self._rollout_path:
@@ -886,93 +948,142 @@ class InterMimicArticulated(InterMimic):
         self._terminate_buf[:] = self._rollout_terminated.to(self._terminate_buf.dtype)
 
     def compute_obj_reward(self, weights):
+        """Use the author rigid-object reward on the active link instead."""
+
         self._contact_measurement_cache = None
-        native, reset, obj_points, ref_obj_points = super().compute_obj_reward(weights)
         frames = self._reference_frame()
-        if self._active_dof_count:
-            q = self._target_dof_pos[:, self._active_dof_ids]
-            q_reference = self._q_reference[frames][:, self._active_dof_ids]
-            q_error = torch.mean(
-                ((q - q_reference) / self._q_range) ** 2,
-                dim=1,
-            )
-            q_reward = torch.exp(-self._q_reward_scale * q_error)
-            next_frames = torch.clamp(
-                frames + 1, max=self._q_reference.shape[0] - 1
-            )
-            reference_qvel = (
-                self._q_reference[next_frames][:, self._active_dof_ids]
-                - q_reference
-            ) * self._rollout_fps
-            qvel_error = torch.mean(
-                (
-                    (
-                        self._target_dof_vel[:, self._active_dof_ids]
-                        - reference_qvel
-                    )
-                    / self._qvel_scale
-                ) ** 2,
-                dim=1,
-            )
-            qvel_reward = torch.exp(-self._qvel_reward_scale * qvel_error)
-        else:
-            q_reward = torch.ones(self.num_envs, device=self.device)
-            qvel_reward = torch.ones_like(q_reward)
-        opposing_contact_power_reward = torch.ones_like(q_reward)
-        conservative_contact_power = torch.zeros_like(q_reward)
-        if self._opposing_contact_power_reward_weight > 0.0:
-            intended, distance, hand_force, region_force = (
-                self._measure_reference_contacts(frames)
-            )
-            (
-                opposing_contact_power_reward,
-                conservative_contact_power,
-                _,
-            ) = _opposing_contact_power_reward(
-                intended=intended,
-                distance=distance,
-                hand_force=hand_force,
-                region_force=region_force,
-                region_force_vector=self._target_contact_forces[
-                    :, self._target_contact_body_ids
-                ],
-                reference_point_velocity=(
-                    self._reference_contact_point_velocity(frames)
-                ),
-                point_link_ids=self._contact_point_link_ids,
-                distance_threshold=self._target_contact_distance_threshold,
-                force_threshold=self._target_contact_force_threshold,
-                power_scale=self._contact_power_scale,
-                positive_margin=self._contact_power_margin,
-                error_scale=self._opposing_contact_power_reward_scale,
-                reward_floor=self._opposing_contact_power_reward_floor,
-            )
-        link_reward = torch.ones_like(q_reward)
-        if self._live_link_ids.numel() > 0:
-            live = self._target_body_state[:, self._live_link_ids, :3]
-            ref = self._link_reference[frames][:, self._reference_link_ids]
-            link_reward = torch.exp(
-                -self._link_reward_scale * torch.mean((live - ref) ** 2, dim=(1, 2))
-            )
-        scale = (
-            torch.pow(q_reward, self._q_reward_weight)
-            * torch.pow(qvel_reward, self._qvel_reward_weight)
-            * torch.pow(
-                opposing_contact_power_reward,
-                self._opposing_contact_power_reward_weight,
-            )
-            * torch.pow(link_reward, self._link_reward_weight)
+        live = self._target_body_state[:, self._active_body_id]
+        reference_pos = self._link_reference[frames, self._active_reference_link_id]
+        reference_rot = self._link_reference_rot[frames, self._active_reference_link_id]
+        reference_vel = self._link_reference_vel[frames, self._active_reference_link_id]
+        reference_ang_vel = self._link_reference_ang_vel[
+            frames, self._active_reference_link_id
+        ]
+
+        root_pos = self.extract_data_component("root_pos", obs=self._curr_obs)
+        root_rot = self.extract_data_component("root_rot", obs=self._curr_obs)
+        heading = torch_utils.calc_heading_quat_inv(root_rot)
+        local_pos = live[:, :3] - root_pos
+        local_pos[..., -1] = live[:, 2]
+        local_pos = torch_utils.quat_rotate(heading, local_pos)
+        local_rot = quat_mul(heading, live[:, 3:7])
+
+        reference_root_pos = self.extract_data_component(
+            "root_pos", obs=self._curr_ref_obs
         )
-        self.extras["articulation_q_reward"] = q_reward
-        self.extras["articulation_qvel_reward"] = qvel_reward
-        self.extras[
-            "articulation_opposing_contact_power_reward"
-        ] = opposing_contact_power_reward
-        self.extras[
-            "articulation_conservative_contact_power_w"
-        ] = conservative_contact_power
-        self.extras["articulation_link_reward"] = link_reward
-        return native * scale, reset, obj_points, ref_obj_points
+        reference_root_rot = self.extract_data_component(
+            "root_rot", obs=self._curr_ref_obs
+        )
+        reference_heading = torch_utils.calc_heading_quat_inv(reference_root_rot)
+        reference_local_pos = reference_pos - reference_root_pos
+        reference_local_pos[..., -1] = reference_pos[:, 2]
+        reference_local_pos = torch_utils.quat_rotate(
+            reference_heading, reference_local_pos
+        )
+        reference_local_rot = quat_mul(reference_heading, reference_rot)
+
+        position_reward = torch.exp(
+            -weights["op"]
+            * torch.mean((reference_local_pos - local_pos) ** 2, dim=-1)
+        )
+        rotation_difference = torch_utils.quat_mul_norm(
+            torch_utils.quat_inverse(reference_local_rot), local_rot
+        )
+        rotation_angle, _ = torch_utils.quat_to_angle_axis(rotation_difference)
+        rotation_reward = torch.exp(-weights["or"] * rotation_angle)
+        velocity_reward = torch.exp(
+            -weights["opv"] * torch.mean((reference_vel - live[:, 7:10]) ** 2, dim=-1)
+        )
+        angular_velocity_reward = torch.exp(
+            -weights["orv"]
+            * torch.mean((reference_ang_vel - live[:, 10:13]) ** 2, dim=-1)
+        )
+
+        moving = (self.progress_buf - self.start_times > 2).float()
+        linear_acceleration = (
+            (live[:, 7:10] - self._previous_active_link_vel) * self.fps_data
+        ) * moving.unsqueeze(-1)
+        angular_acceleration = (
+            (live[:, 10:13] - self._previous_active_link_ang_vel) * self.fps_data
+        ) * moving.unsqueeze(-1)
+        energy_reward = torch.exp(
+            -weights["eg2"] * torch.mean(linear_acceleration.square(), dim=-1)
+        ) * torch.exp(
+            -weights["eg2"] * torch.mean(angular_acceleration.square(), dim=-1)
+        )
+        self._previous_active_link_vel.copy_(live[:, 7:10])
+        self._previous_active_link_ang_vel.copy_(live[:, 10:13])
+
+        obj_points = self._surface_points(
+            self._target_body_state,
+            self._active_surface_points,
+            self._active_surface_body_ids,
+        )
+        ref_obj_points = self._reference_surface_points(
+            frames,
+            self._active_surface_points,
+            self._active_surface_reference_link_ids,
+        )
+        object_reward = (
+            position_reward
+            * rotation_reward
+            * velocity_reward
+            * angular_velocity_reward
+            * energy_reward
+        )
+        object_reset = (obj_points - ref_obj_points).norm(dim=-1).mean(dim=-1) > 0.5
+        self.extras["active_link_position_reward"] = position_reward
+        self.extras["active_link_rotation_reward"] = rotation_reward
+        self.extras["active_link_velocity_reward"] = velocity_reward
+        self.extras["active_link_angular_velocity_reward"] = angular_velocity_reward
+        return object_reward, object_reset, obj_points, ref_obj_points
+
+    def compute_ig_reward(self, weights, key_pos, ref_key_pos, _obj_points, _ref_obj_points):
+        """Keep the author interaction-graph reward on the selected surface pool."""
+
+        frames = self._reference_frame()
+        obj_points = self._surface_points(
+            self._target_body_state,
+            self._graph_surface_points,
+            self._graph_body_ids,
+        )
+        ref_obj_points = self._reference_surface_points(
+            frames,
+            self._graph_surface_points,
+            self._graph_reference_link_ids,
+        )
+        key_count = len(self._key_body_ids)
+        interaction = key_pos.view(-1, key_count, 3).unsqueeze(2) - obj_points.unsqueeze(1)
+        reference_interaction = (
+            ref_key_pos.view(-1, key_count, 3).unsqueeze(2) - ref_obj_points.unsqueeze(1)
+        )
+        weight = 1.0 / torch.clamp(interaction.square().sum(dim=-1), min=0.01)
+        weight = weight / weight.sum(dim=-1, keepdim=True).sum(dim=-2, keepdim=True)
+        reference_weight = 1.0 / torch.clamp(
+            reference_interaction.square().sum(dim=-1), min=0.01
+        )
+        reference_weight = reference_weight / reference_weight.sum(
+            dim=-1, keepdim=True
+        ).sum(dim=-2, keepdim=True)
+        error = (interaction - reference_interaction).square().sum(dim=-1)
+        reward = torch.exp(
+            -weights["ig"] * (error * (weight + reference_weight)).sum(dim=(1, 2)) * 0.5
+        )
+        reference_normalized_error = (
+            (interaction - reference_interaction).square().sum(dim=-1).sqrt()
+            / torch.clamp(
+                reference_interaction.square().sum(dim=-1).sqrt(), min=0.5
+            )
+        )
+        live_normalized_error = (
+            (interaction - reference_interaction).square().sum(dim=-1).sqrt()
+            / torch.clamp(interaction.square().sum(dim=-1).sqrt(), min=0.5)
+        )
+        reset = torch.logical_or(
+            reference_normalized_error.amax(dim=(1, 2)) > 2,
+            live_normalized_error.amax(dim=(1, 2)) > 2,
+        )
+        return reward, reset
 
     def compute_cg_reward(self, weights):
         """Match hand2 labels to contact with the configured target region."""
@@ -1069,16 +1180,61 @@ class InterMimicArticulated(InterMimic):
         reference_lookup = {
             name: index for index, name in enumerate(self._reference_link_names)
         }
-        self._live_link_ids = torch.as_tensor(
-            [body_lookup[name] for name in self._active_link_names],
-            device=self.device,
-            dtype=torch.long,
+        active_link = self._active_link_names[0]
+        self._active_body_id = body_lookup[active_link]
+        self._active_reference_link_id = reference_lookup[active_link]
+        if set(self._active_surface_link_names) != {active_link}:
+            raise ValueError(
+                "active interaction surface must contain only the active task link"
+            )
+
+        def surface_tensors(points, names, label):
+            unknown = sorted(set(names).difference(body_lookup))
+            if unknown:
+                raise ValueError(f"{label} interaction surface has unknown links: {unknown}")
+            return (
+                torch.as_tensor(points, device=self.device, dtype=torch.float32),
+                torch.as_tensor(
+                    [body_lookup[name] for name in names],
+                    device=self.device,
+                    dtype=torch.long,
+                ),
+                torch.as_tensor(
+                    [reference_lookup[name] for name in names],
+                    device=self.device,
+                    dtype=torch.long,
+                ),
+            )
+
+        (
+            self._active_surface_points,
+            self._active_surface_body_ids,
+            self._active_surface_reference_link_ids,
+        ) = surface_tensors(
+            self._active_surface_points_np,
+            self._active_surface_link_names,
+            "active",
         )
-        self._reference_link_ids = torch.as_tensor(
-            [reference_lookup[name] for name in self._active_link_names],
-            device=self.device,
-            dtype=torch.long,
-        )
+        if self._surface_mode == "active_link":
+            (
+                self._graph_surface_points,
+                self._graph_body_ids,
+                self._graph_reference_link_ids,
+            ) = (
+                self._active_surface_points,
+                self._active_surface_body_ids,
+                self._active_surface_reference_link_ids,
+            )
+        else:
+            (
+                self._graph_surface_points,
+                self._graph_body_ids,
+                self._graph_reference_link_ids,
+            ) = surface_tensors(
+                self._full_surface_points_np,
+                self._full_surface_link_names,
+                "full",
+            )
 
         human_names = list(self.gym.get_actor_rigid_body_names(self.envs[0], self.humanoid_handles[0]))
         if tuple(human_names) != self._common_human_body_names:
@@ -1203,12 +1359,6 @@ class InterMimicArticulated(InterMimic):
             device=self.device,
             dtype=torch.long,
         )
-        if self._use_articulated_graph:
-            if not self._contact_point_link_names:
-                raise ValueError("articulated_graph requires contact-region points")
-            self._graph_reference_link_ids = (
-                self._contact_point_reference_link_ids
-            )
 
     def _measure_contacts(self, env_ids=None):
         if env_ids is None:
@@ -1327,31 +1477,6 @@ class InterMimicArticulated(InterMimic):
             region_force,
         )
         return intended, distance, hand_force, region_force
-
-    def _reference_contact_point_velocity(self, frames):
-        next_frames = torch.clamp(
-            frames + 1,
-            max=self._link_reference.shape[0] - 1,
-        )
-
-        def world_points(frame_ids):
-            pos = self._link_reference[frame_ids][
-                :, self._contact_point_reference_link_ids
-            ]
-            rot = self._link_reference_rot[frame_ids][
-                :, self._contact_point_reference_link_ids
-            ]
-            local = self._contact_points.unsqueeze(0).expand(
-                frame_ids.shape[0], -1, -1
-            )
-            return pos + torch_utils.quat_rotate(
-                rot.reshape(-1, 4),
-                local.reshape(-1, 3),
-            ).view_as(local)
-
-        return (
-            world_points(next_frames) - world_points(frames)
-        ) * self._rollout_fps
 
     def post_physics_step(self):
         super().post_physics_step()
