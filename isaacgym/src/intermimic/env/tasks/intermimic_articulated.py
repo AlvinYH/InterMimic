@@ -121,7 +121,7 @@ class InterMimicArticulated(InterMimic):
         global capsule_region_surface_distances
         global hand2_body_groups
         global load_hand_collision_geometry
-        from pipeline.physics.common_rollout import CommonRolloutRecorder, SMPLX_BODY_NAMES
+        from pipeline.physics.common_rollout import SMPLX_BODY_NAMES, SMPLX_DOF_NAMES
         from pipeline.physics.contact import (
             box_region_surface_distances,
             capsule_region_surface_distances,
@@ -364,14 +364,17 @@ class InterMimicArticulated(InterMimic):
         self._create_static_box_actors = create_static_box_actors
         self._load_articulated_asset = load_articulated_asset
         self._load_static_box_assets = load_static_box_assets
-        self._CommonRolloutRecorder = CommonRolloutRecorder
         self._common_human_body_names = SMPLX_BODY_NAMES
+        self._common_human_dof_names = SMPLX_DOF_NAMES
 
         self._target_contact_distance_threshold = float(
             env["articulationContactDistanceThreshold"]
         )
         self._target_contact_force_threshold = float(
             env["articulationContactForceThreshold"]
+        )
+        self._use_target_region_contact_reward = bool(
+            env.get("useTargetRegionContactReward", False)
         )
         self._contact_distance_chunk_size = 64
         if (
@@ -398,7 +401,8 @@ class InterMimicArticulated(InterMimic):
         self._humanoid_mjcf_path = Path(
             env["articulatedHumanoidXmlPath"]
         ).expanduser().resolve()
-        self._recorder = None
+        self._rollout_frames = []
+        self._rollout_reference_body_position = None
         self._rollout_next_frame = None
         self._rollout_written = False
         self._rollout_terminated = None
@@ -439,14 +443,19 @@ class InterMimicArticulated(InterMimic):
         if self._rollout_path:
             if self.num_envs != 1:
                 raise ValueError("common rollout recording requires exactly one environment")
-            self._recorder = self._CommonRolloutRecorder(
-                self._rollout_path,
-                fps=self._rollout_fps,
-                object_joint_qpos_reference=self._q_reference_np,
-                joint_names=self._joint_names,
-                joint_types=self._joint_types,
-                intended=self._intended_contact_np,
-                contact_region_link_names=self._target_contact_link_names,
+            reference_frames = torch.arange(
+                self._q_reference_np.shape[0],
+                device=self.device,
+            )
+            reference_ids = self.data_id[:1].expand_as(reference_frames)
+            reference_body_pos = self.extract_data_component(
+                "body_pos",
+                ref=True,
+                data_id=reference_ids,
+                t=reference_frames,
+            ).reshape(len(reference_frames), self.num_bodies, 3)
+            self._rollout_reference_body_position = (
+                reference_body_pos.detach().cpu().numpy().astype(np.float32)
             )
 
     def _load_target_asset(self):
@@ -592,7 +601,7 @@ class InterMimicArticulated(InterMimic):
     def _reset_envs(self, env_ids):
         super()._reset_envs(env_ids)
         if (
-            self._recorder is None
+            not self._rollout_path
             or self._rollout_written
             or self.num_envs != 1
             or self._q_reference is None
@@ -647,8 +656,7 @@ class InterMimicArticulated(InterMimic):
             self._human_contact_box_valid,
             self._human_contact_local_groups,
         )[0]
-        self._recorder.append(
-            0,
+        self._rollout_frames.append(dict(
             human_root_state=self._humanoid_root_states[0].detach().cpu().numpy(),
             human_dof_pos=self._dof_pos[0].detach().cpu().numpy(),
             human_body_state=body_state.detach().cpu().numpy(),
@@ -657,7 +665,7 @@ class InterMimicArticulated(InterMimic):
             region_distance_m=distance.detach().cpu().numpy(),
             hand_force_n=np.zeros(2, dtype=np.float32),
             region_force_n=np.zeros(link_count, dtype=np.float32),
-        )
+        ))
         self._rollout_next_frame = 1
 
     def pre_physics_step(self, actions):
@@ -1088,6 +1096,9 @@ class InterMimicArticulated(InterMimic):
     def compute_cg_reward(self, weights):
         """Match hand2 labels to contact with the configured target region."""
 
+        if not self._use_target_region_contact_reward:
+            return super().compute_cg_reward(weights)
+
         contact_threshold = 0.1
         frames = self._reference_frame()
         cached = getattr(self, "_contact_measurement_cache", None)
@@ -1480,7 +1491,7 @@ class InterMimicArticulated(InterMimic):
 
     def post_physics_step(self):
         super().post_physics_step()
-        if self._recorder is None or self._rollout_written:
+        if not self._rollout_path or self._rollout_written:
             return
         distance, hand_force, region_force = self._measure_contacts()
         frame = int(self._reference_frame()[0].item())
@@ -1491,8 +1502,7 @@ class InterMimicArticulated(InterMimic):
                 "InterMimic recorder expected reference frame "
                 f"{self._rollout_next_frame}, got {frame}"
             )
-        self._recorder.append(
-            frame,
+        self._rollout_frames.append(dict(
             human_root_state=self._humanoid_root_states[0].detach().cpu().numpy(),
             human_dof_pos=self._dof_pos[0].detach().cpu().numpy(),
             human_body_state=self._rigid_body_state.view(
@@ -1503,12 +1513,74 @@ class InterMimicArticulated(InterMimic):
             region_distance_m=distance[0].detach().cpu().numpy(),
             hand_force_n=hand_force[0].detach().cpu().numpy(),
             region_force_n=region_force[0].detach().cpu().numpy(),
-        )
+        ))
         self._rollout_next_frame += 1
         done = bool(self.reset_buf[0].item()) or frame >= self._q_reference.shape[0] - 1
         if done:
-            self._recorder.seal()
+            self._write_common_rollout()
             self._rollout_written = True
+
+    def _write_common_rollout(self):
+        total_frames = len(self._q_reference_np)
+        valid_frames = len(self._rollout_frames)
+        if not 1 <= valid_frames <= total_frames:
+            raise RuntimeError("InterMimic rollout frames do not match the reference")
+
+        def states(name):
+            values = np.stack([frame[name] for frame in self._rollout_frames]).astype(
+                np.float32
+            )
+            if valid_frames < total_frames:
+                values = np.concatenate(
+                    (
+                        values,
+                        np.broadcast_to(
+                            values[-1],
+                            (total_frames - valid_frames, *values.shape[1:]),
+                        ),
+                    ),
+                    axis=0,
+                )
+            return values
+
+        def forces(name):
+            values = np.stack([frame[name] for frame in self._rollout_frames]).astype(
+                np.float32
+            )
+            if valid_frames < total_frames:
+                values = np.concatenate(
+                    (
+                        values,
+                        np.zeros(
+                            (total_frames - valid_frames, *values.shape[1:]),
+                            dtype=np.float32,
+                        ),
+                    ),
+                    axis=0,
+                )
+            return values
+
+        np.savez_compressed(
+            self._rollout_path,
+            fps=np.asarray(self._rollout_fps, dtype=np.float32),
+            valid_frame_count=np.asarray(valid_frames, dtype=np.int64),
+            human_root_state=states("human_root_state"),
+            human_dof_pos=states("human_dof_pos"),
+            human_body_state=states("human_body_state"),
+            human_body_position_reference=self._rollout_reference_body_position,
+            human_body_names=np.asarray(self._common_human_body_names),
+            human_dof_names=np.asarray(self._common_human_dof_names),
+            object_root_state=states("object_root_state"),
+            object_joint_qpos=states("object_joint_qpos"),
+            object_joint_qpos_reference=self._q_reference_np.astype(np.float32),
+            joint_names=np.asarray(self._joint_names),
+            joint_types=np.asarray(self._joint_types),
+            region_distance_m=states("region_distance_m"),
+            intended=np.asarray(self._intended_contact_np, dtype=np.bool_),
+            hand_force_n=forces("hand_force_n"),
+            region_force_n=forces("region_force_n"),
+            contact_region_link_names=np.asarray(self._target_contact_link_names),
+        )
 
 
 __all__ = ["InterMimicArticulated"]
