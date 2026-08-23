@@ -14,33 +14,30 @@ from isaacgym.torch_utils import quat_mul, to_torch
 from ...utils import torch_utils
 
 
-def _target_region_contact_reward(
+def _active_link_contact_reward(
     *,
     intended,
     distance,
     hand_force,
-    region_force,
+    link_force,
     distance_threshold,
     force_threshold,
     missing_weight,
 ):
-    """Reward only intended hand contact with the configured object region."""
+    """Reward intended hand contact only when it reaches the active link."""
 
     if intended.shape != hand_force.shape or intended.ndim != 2:
         raise ValueError("intended and hand_force must share shape (envs, hands)")
     if distance.ndim != 3 or distance.shape[:2] != intended.shape:
-        raise ValueError("distance must have shape (envs, hands, target_links)")
-    if region_force.shape != (intended.shape[0], distance.shape[2]):
-        raise ValueError("region_force must have shape (envs, target_links)")
+        raise ValueError("distance must have shape (envs, hands, active_links)")
+    if link_force.shape != (intended.shape[0], distance.shape[2]):
+        raise ValueError("link_force must have shape (envs, active_links)")
 
     intended_contact = intended > 0.1
-    near_region_by_link = distance <= distance_threshold
+    near_link = distance <= distance_threshold
     loaded_hand = hand_force >= force_threshold
-    loaded_region_by_link = region_force[:, None, :] >= force_threshold
-    live_target_contact = loaded_hand & torch.any(
-        near_region_by_link & loaded_region_by_link,
-        dim=2,
-    )
+    loaded_link = link_force[:, None, :] >= force_threshold
+    live_contact = loaded_hand & torch.any(near_link & loaded_link, dim=2)
     nearest_distance = distance.amin(dim=2)
 
     floor = 0.5 * (
@@ -56,9 +53,11 @@ def _target_region_contact_reward(
     proximity = torch.exp(
         -nearest_distance.clamp_min(0.0) / float(distance_threshold)
     )
-    proximity = torch.where(torch.isfinite(proximity), proximity, torch.zeros_like(proximity))
+    proximity = torch.where(
+        torch.isfinite(proximity), proximity, torch.zeros_like(proximity)
+    )
     score = torch.where(
-        live_target_contact,
+        live_contact,
         torch.ones_like(proximity),
         0.5 * proximity,
     )
@@ -67,8 +66,8 @@ def _target_region_contact_reward(
         floor + (1.0 - floor) * score,
         torch.ones_like(score),
     )
-    hand_error = (intended_contact & ~live_target_contact).to(dtype=distance.dtype)
-    return hand_reward, hand_error, live_target_contact
+    hand_error = (intended_contact & ~live_contact).to(dtype=distance.dtype)
+    return hand_reward, hand_error, live_contact
 
 
 def _initial_object_reset_state(
@@ -139,7 +138,6 @@ class InterMimicArticulated(InterMimic):
             validate_humanoid_object_collision_filters,
         )
         self._object_collision_filter = ARTICULATED_OBJECT_COLLISION_FILTER
-        self._static_collision_filter = STATIC_SCENE_COLLISION_FILTER
         self._add_ground_plane = add_ground_plane
         self._validate_humanoid_object_collision_filters = (
             validate_humanoid_object_collision_filters
@@ -148,6 +146,17 @@ class InterMimicArticulated(InterMimic):
         env = cfg["env"]
         manifest_path = Path(env["articulatedInputPath"]).expanduser().resolve()
         self._object_config = json.loads(manifest_path.read_text(encoding="utf-8"))
+        static_collision_filter = self._object_config.get(
+            "static_box_collision_filter",
+            STATIC_SCENE_COLLISION_FILTER,
+        )
+        if (
+            isinstance(static_collision_filter, bool)
+            or not isinstance(static_collision_filter, int)
+            or static_collision_filter < 0
+        ):
+            raise ValueError("static_box_collision_filter must be a non-negative integer")
+        self._static_collision_filter = static_collision_filter
         object_reference_path = Path(
             self._object_config["reference_path"]
         ).expanduser().resolve()
@@ -205,34 +214,26 @@ class InterMimicArticulated(InterMimic):
                 str(value) for value in np.asarray(values["body_names"]).tolist()
             ]
             self._intended_contact_np = np.asarray(values["intended"], dtype=np.bool_)
+            self._reference_fps = float(np.asarray(values["fps"]).item())
+            self._object_surface_mode = str(
+                np.asarray(values["object_surface_mode"]).item()
+            )
+            self._object_surface_points_np = np.asarray(
+                values["object_surface_points_link_local_scaled"], dtype=np.float32
+            )
+            self._object_surface_link_names = [
+                str(value)
+                for value in np.asarray(
+                    values["object_surface_point_link_names"]
+                ).tolist()
+            ]
             self._contact_points_np = np.asarray(
-                values["contact_points_link_local_scaled"], dtype=np.float32
+                values["collision_surface_points_link_local_scaled"], dtype=np.float32
             )
             self._contact_point_link_names = [
                 str(value)
-                for value in np.asarray(values["contact_point_link_names"]).tolist()
-            ]
-            self._contact_region_link_names = [
-                str(value)
-                for value in np.asarray(values["contact_region_link_names"]).tolist()
-            ]
-            self._reference_fps = float(np.asarray(values["fps"]).item())
-            self._active_surface_points_np = np.asarray(
-                values["active_surface_points_link_local_scaled"], dtype=np.float32
-            )
-            self._active_surface_link_names = [
-                str(value)
                 for value in np.asarray(
-                    values["active_surface_point_link_names"]
-                ).tolist()
-            ]
-            self._full_surface_points_np = np.asarray(
-                values["full_surface_points_link_local_scaled"], dtype=np.float32
-            )
-            self._full_surface_link_names = [
-                str(value)
-                for value in np.asarray(
-                    values["full_surface_point_link_names"]
+                    values["collision_surface_point_link_names"]
                 ).tolist()
             ]
         self._object_creation_pos_np, self._object_creation_rot_np = _object_creation_pose(
@@ -278,12 +279,6 @@ class InterMimicArticulated(InterMimic):
             != [str(value) for value in self._object_config["body_names"]]
         ):
             raise ValueError("Articulated manifest and reference topology disagree")
-        self._surface_mode = str(env["intermimicSurface"])
-        if self._surface_mode not in {"active_link", "full_object"}:
-            raise ValueError(
-                "intermimicSurface must be 'active_link' or 'full_object', got "
-                f"{self._surface_mode!r}"
-            )
         if (
             self._q_reference_np.ndim != 2
             or self._q_reference_np.shape[1] != self._object_dof_count
@@ -333,33 +328,18 @@ class InterMimicArticulated(InterMimic):
         if self._intended_contact_np.shape != (self._q_reference_np.shape[0], 2):
             raise ValueError("intended contact must have shape (frames, 2)")
         if self._contact_points_np.shape != (len(self._contact_point_link_names), 3):
-            raise ValueError("Contact region points and point-link names disagree")
+            raise ValueError("Collision-surface points and point-link names disagree")
+        if not self._contact_point_link_names:
+            raise ValueError("Object collision surface must not be empty")
+        if self._object_surface_mode not in ("active_part", "full_object"):
+            raise ValueError("Object surface mode must be active_part or full_object")
         if (
-            not self._contact_region_link_names
-            or len(set(self._contact_region_link_names))
-            != len(self._contact_region_link_names)
-            or set(self._contact_point_link_names)
-            != set(self._contact_region_link_names)
+            self._object_surface_points_np.shape != (1024, 3)
+            or len(self._object_surface_link_names) != 1024
         ):
-            raise ValueError("Canonical contact-region names and points disagree")
-        for points, names, label in (
-            (
-                self._active_surface_points_np,
-                self._active_surface_link_names,
-                "active",
-            ),
-            (
-                self._full_surface_points_np,
-                self._full_surface_link_names,
-                "full",
-            ),
-        ):
-            if points.shape != (1024, 3) or len(names) != 1024:
-                raise ValueError(
-                    f"{label} interaction surface must contain exactly 1,024 points"
-                )
-            if not np.isfinite(points).all():
-                raise ValueError(f"{label} interaction surface must be finite")
+            raise ValueError("Object interaction surface must contain exactly 1,024 points")
+        if not np.isfinite(self._object_surface_points_np).all():
+            raise ValueError("Object interaction surface must be finite")
         self._configure_articulated_actor = configure_articulated_actor
         self._create_static_box_actors = create_static_box_actors
         self._load_articulated_asset = load_articulated_asset
@@ -372,9 +352,6 @@ class InterMimicArticulated(InterMimic):
         )
         self._target_contact_force_threshold = float(
             env["articulationContactForceThreshold"]
-        )
-        self._use_target_region_contact_reward = bool(
-            env.get("useTargetRegionContactReward", False)
         )
         self._contact_distance_chunk_size = 64
         if (
@@ -408,6 +385,7 @@ class InterMimicArticulated(InterMimic):
         self._rollout_terminated = None
         self._contact_measurement_cache = None
         self._q_reference = None
+        self._static_box_handles = []
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
         self._q_reference = torch.as_tensor(self._q_reference_np, device=self.device)
         self._qvel_reference = torch.as_tensor(
@@ -457,6 +435,8 @@ class InterMimicArticulated(InterMimic):
             self._rollout_reference_body_position = (
                 reference_body_pos.detach().cpu().numpy().astype(np.float32)
             )
+        from scripts.physics.capture_isaac_runtime import request_task_physics_dump
+        request_task_physics_dump(self)
 
     def _load_target_asset(self):
         asset, properties = self._load_articulated_asset(
@@ -479,7 +459,7 @@ class InterMimicArticulated(InterMimic):
             self.gym.get_asset_rigid_shape_count(asset) + len(self._static_box_assets)
         )
         self.object_points = torch.as_tensor(
-            self._active_surface_points_np[None],
+            self._object_surface_points_np[None],
             device=self.device,
         )
 
@@ -526,7 +506,7 @@ class InterMimicArticulated(InterMimic):
             env_ptr,
             self.humanoid_handles[env_id],
         )
-        self._create_static_box_actors(
+        handles = self._create_static_box_actors(
             self.gym,
             env_ptr,
             env_id,
@@ -534,6 +514,8 @@ class InterMimicArticulated(InterMimic):
             self._object_config,
             collision_filter=self._static_collision_filter,
         )
+        if env_id == 0:
+            self._static_box_handles = handles
 
     def _build_target_tensors(self):
         num_actors = self.get_num_actors_per_env()
@@ -600,6 +582,8 @@ class InterMimicArticulated(InterMimic):
 
     def _reset_envs(self, env_ids):
         super()._reset_envs(env_ids)
+        from scripts.physics.capture_isaac_runtime import write_requested_task_physics
+        write_requested_task_physics(self)
         if (
             not self._rollout_path
             or self._rollout_written
@@ -1024,13 +1008,13 @@ class InterMimicArticulated(InterMimic):
 
         obj_points = self._surface_points(
             self._target_body_state,
-            self._active_surface_points,
-            self._active_surface_body_ids,
+            self._object_surface_points,
+            self._object_surface_body_ids,
         )
         ref_obj_points = self._reference_surface_points(
             frames,
-            self._active_surface_points,
-            self._active_surface_reference_link_ids,
+            self._object_surface_points,
+            self._object_surface_reference_link_ids,
         )
         object_reward = (
             position_reward
@@ -1094,20 +1078,15 @@ class InterMimicArticulated(InterMimic):
         return reward, reset
 
     def compute_cg_reward(self, weights):
-        """Match hand2 labels to contact with the configured target region."""
-
-        if not self._use_target_region_contact_reward:
-            return super().compute_cg_reward(weights)
+        """Adapt the author contact graph to the active articulated link."""
 
         contact_threshold = 0.1
         frames = self._reference_frame()
         cached = getattr(self, "_contact_measurement_cache", None)
         if cached is not None and torch.equal(cached[0], frames):
-            _, intended, distance, hand_force, region_force = cached
+            _, intended, distance, hand_force, link_force = cached
         else:
-            intended = (
-                self._intended_contact[frames] > contact_threshold
-            ).float()
+            intended = (self._intended_contact[frames] > contact_threshold).float()
             link_count = len(self._target_contact_link_names)
             distance = torch.full(
                 (self.num_envs, intended.shape[1], link_count),
@@ -1115,7 +1094,7 @@ class InterMimicArticulated(InterMimic):
                 device=self.device,
             )
             hand_force = torch.zeros_like(intended)
-            region_force = torch.zeros(
+            link_force = torch.zeros(
                 (self.num_envs, link_count),
                 device=self.device,
             )
@@ -1124,30 +1103,25 @@ class InterMimicArticulated(InterMimic):
                 as_tuple=False,
             ).reshape(-1)
             if active_env_ids.numel() > 0:
-                active_distance, active_hand_force, active_region_force = (
+                active_distance, active_hand_force, active_link_force = (
                     self._measure_contacts(active_env_ids)
                 )
                 distance[active_env_ids] = active_distance
                 hand_force[active_env_ids] = active_hand_force
-                region_force[active_env_ids] = active_region_force
+                link_force[active_env_ids] = active_link_force
 
-        hand_reward, hand_error, live_target_contact = (
-            _target_region_contact_reward(
-                intended=intended,
-                distance=distance,
-                hand_force=hand_force,
-                region_force=region_force,
-                distance_threshold=self._target_contact_distance_threshold,
-                force_threshold=self._target_contact_force_threshold,
-                missing_weight=weights["cg_hand"],
-            )
+        hand_reward, hand_error, live_contact = _active_link_contact_reward(
+            intended=intended,
+            distance=distance,
+            hand_force=hand_force,
+            link_force=link_force,
+            distance_threshold=self._target_contact_distance_threshold,
+            force_threshold=self._target_contact_force_threshold,
+            missing_weight=weights["cg_hand"],
         )
         human_contact = self.extract_data_component(
             "contact_human", obs=self._curr_obs
         )
-
-        # Keep the native non-hand contact and total-contact energy terms. Hand
-        # references are deliberately absent here because their only GT is hand2.
         ref_other_contact = self.extract_data_component(
             "contact_human", obs=self._curr_ref_obs
         )[:, self._human_other_contact_body_ids]
@@ -1173,10 +1147,10 @@ class InterMimicArticulated(InterMimic):
             * prohibited_reward
             * energy_reward
         )
-        self.extras["target_contact_reward"] = hand_reward.mean(dim=1)
-        self.extras["target_contact_live"] = live_target_contact.float().mean(dim=1)
+        self.extras["active_link_contact_reward"] = hand_reward.mean(dim=1)
+        self.extras["active_link_contact_live"] = live_contact.float().mean(dim=1)
         nearest_distance = distance.amin(dim=2)
-        self.extras["target_contact_distance_m"] = torch.where(
+        self.extras["active_link_contact_distance_m"] = torch.where(
             torch.isfinite(nearest_distance),
             nearest_distance,
             torch.zeros_like(nearest_distance),
@@ -1194,10 +1168,14 @@ class InterMimicArticulated(InterMimic):
         active_link = self._active_link_names[0]
         self._active_body_id = body_lookup[active_link]
         self._active_reference_link_id = reference_lookup[active_link]
-        if set(self._active_surface_link_names) != {active_link}:
-            raise ValueError(
-                "active interaction surface must contain only the active task link"
-            )
+        surface_links = set(self._object_surface_link_names)
+        if self._object_surface_mode == "active_part":
+            if surface_links != {active_link}:
+                raise ValueError(
+                    "active_part interaction surface must contain only the active task link"
+                )
+        elif not surface_links.issubset(set(self._reference_link_names)):
+            raise ValueError("full_object interaction surface has unknown links")
 
         def surface_tensors(points, names, label):
             unknown = sorted(set(names).difference(body_lookup))
@@ -1218,34 +1196,23 @@ class InterMimicArticulated(InterMimic):
             )
 
         (
-            self._active_surface_points,
-            self._active_surface_body_ids,
-            self._active_surface_reference_link_ids,
+            self._object_surface_points,
+            self._object_surface_body_ids,
+            self._object_surface_reference_link_ids,
         ) = surface_tensors(
-            self._active_surface_points_np,
-            self._active_surface_link_names,
-            "active",
+            self._object_surface_points_np,
+            self._object_surface_link_names,
+            self._object_surface_mode,
         )
-        if self._surface_mode == "active_link":
-            (
-                self._graph_surface_points,
-                self._graph_body_ids,
-                self._graph_reference_link_ids,
-            ) = (
-                self._active_surface_points,
-                self._active_surface_body_ids,
-                self._active_surface_reference_link_ids,
-            )
-        else:
-            (
-                self._graph_surface_points,
-                self._graph_body_ids,
-                self._graph_reference_link_ids,
-            ) = surface_tensors(
-                self._full_surface_points_np,
-                self._full_surface_link_names,
-                "full",
-            )
+        (
+            self._graph_surface_points,
+            self._graph_body_ids,
+            self._graph_reference_link_ids,
+        ) = (
+            self._object_surface_points,
+            self._object_surface_body_ids,
+            self._object_surface_reference_link_ids,
+        )
 
         human_names = list(self.gym.get_actor_rigid_body_names(self.envs[0], self.humanoid_handles[0]))
         if tuple(human_names) != self._common_human_body_names:
@@ -1322,10 +1289,16 @@ class InterMimicArticulated(InterMimic):
         )
 
         self._target_contact_link_names = tuple(
-            self._contact_region_link_names
+            dict.fromkeys(self._contact_point_link_names)
         )
-        if not self._target_contact_link_names:
-            raise ValueError("Contact region must contain at least one object link")
+        target_contact_links = set(self._target_contact_link_names)
+        if self._object_surface_mode == "active_part":
+            if target_contact_links != {active_link}:
+                raise ValueError(
+                    "active_part collision surface must belong only to the active task link"
+                )
+        elif not target_contact_links.issubset(set(self._reference_link_names)):
+            raise ValueError("full_object collision surface has unknown links")
         region_names = set(self._target_contact_link_names)
         missing_region_links = sorted(region_names.difference(body_lookup))
         if missing_region_links:

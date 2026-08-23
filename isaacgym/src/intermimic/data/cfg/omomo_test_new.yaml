@@ -23,7 +23,6 @@ env:
   numObs: 3198
   motion_file: InterAct/OMOMO_new
   robotType: "smplx/omomo.xml"
-  objectDensity: 1000
   localRootObs: False
   keyBodies: ["L_Hip", "L_Knee", "L_Ankle", "L_Toe", "R_Hip", "R_Knee", "R_Ankle", "R_Toe", "Torso", "Spine", "Chest", "Neck", "Head", "L_Thorax", "L_Shoulder", "L_Elbow", "L_Wrist", "R_Thorax", "R_Shoulder", "R_Elbow", "R_Wrist"]
   contactBodies: ["L_Hip", "L_Knee", "L_Ankle", "L_Toe", "R_Hip", "R_Knee", "R_Ankle", "R_Toe", "Torso", "Spine", "Chest", "Neck", "Head", "L_Thorax", "L_Shoulder", "L_Elbow", "L_Wrist", "L_Index3", "L_Middle3", "L_Pinky3", "L_Ring3","L_Thumb3", "R_Thorax", "R_Shoulder", "R_Elbow", "R_Wrist", "R_Index3", "R_Middle3", "R_Pinky3", "R_Ring3","R_Thumb3"] #["right_foot", "left_foot"]
@@ -37,7 +36,7 @@ env:
   plane:
     staticFriction: 0.9
     dynamicFriction: 0.9
-    restitution: 0.1
+    restitution: 0.0
   
   rewardWeights:
     p: 30.
@@ -61,18 +60,17 @@ env:
     eg3: 0.00000000001
 
 sim:
-  substeps: 4
+  substeps: 2
   physx:
     num_threads: 8
     solver_type: 1  # 0: pgs, 1: tgs
-    num_position_iterations: 8
+    num_position_iterations: 4
     num_velocity_iterations: 1
-    contact_offset: 0.02
+    contact_offset: 0.002
     rest_offset: 0.0
     bounce_threshold_velocity: 0.2
-    max_depenetration_velocity: 20.
+    max_depenetration_velocity: 10.0
 
   flex:
     num_inner_iterations: 10
     warm_start: 0.25
-

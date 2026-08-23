@@ -23,6 +23,7 @@ class BaseTask():
 
     def __init__(self, cfg, enable_camera_sensors=False):
         self.gym = gymapi.acquire_gym()
+        self.cfg = cfg
 
         self.device_type = cfg.get("device_type", "cuda")
         self.device_id = cfg.get("device_id", 0)
@@ -43,7 +44,9 @@ class BaseTask():
         self.num_states = cfg["env"].get("numStates", 0)
         self.num_actions = cfg["env"]["numActions"]
 
-        self.control_freq_inv = cfg["env"].get("controlFrequencyInv", 1)
+        # This is a benchmark clock parameter, not an optional convenience
+        # setting.  A missing value must never silently turn into 60 Hz.
+        self.control_freq_inv = cfg["env"]["controlFrequencyInv"]
 
         # optimization flags for pytorch JIT
         torch._C._jit_set_profiling_mode(False)
@@ -118,9 +121,10 @@ class BaseTask():
     def set_sim_params_up_axis(self, sim_params, axis):
         if axis == 'z':
             sim_params.up_axis = gymapi.UP_AXIS_Z
-            sim_params.gravity.x = 0
-            sim_params.gravity.y = 0
-            sim_params.gravity.z = -9.81
+            gravity = self.cfg["env"]["gravity"]
+            sim_params.gravity.x = gravity[0]
+            sim_params.gravity.y = gravity[1]
+            sim_params.gravity.z = gravity[2]
             return 2
         return 1
 

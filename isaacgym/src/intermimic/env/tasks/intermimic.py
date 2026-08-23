@@ -2,6 +2,7 @@ from enum import Enum
 import numpy as np
 import torch
 import os
+from pathlib import Path
 
 from isaacgym import gymtorch
 from isaacgym import gymapi
@@ -14,6 +15,15 @@ import trimesh
 
 from ...utils.path_utils import resolve_data_path
 
+
+def _shared_arctic_physics_cache() -> Path:
+    """Locate the repository-owned fixed ARCTIC collision cache."""
+
+    for parent in Path(__file__).resolve().parents:
+        cache_root = parent / "data" / "ARCTIC" / "physics_cache"
+        if cache_root.is_dir():
+            return cache_root
+    raise FileNotFoundError("Could not locate data/ARCTIC/physics_cache from InterMimic")
 
 
 class InterMimic(Humanoid_SMPLX):
@@ -57,7 +67,6 @@ class InterMimic(Humanoid_SMPLX):
         self.obj2motion = torch.stack([self.object_id == k for k in range(len(object_name_set))], dim=0)
         self.object_name = object_name_set
         self.robot_type = cfg['env']['robotType']
-        self.object_density = cfg['env']['objectDensity']
         self.ref_hoi_obs_size = 7 + 51 * 6 + 52 * 13 + 13 + 52 * 3 + 52 + 1
         self.num_motions = len(self.motion_file)
         self.dataset_index = to_torch([int(data_path.split('/')[-1].split('_')[0][3:]) for data_path in self.motion_file], dtype=torch.long).to(self._init_device)
@@ -305,27 +314,30 @@ class InterMimic(Humanoid_SMPLX):
         return   
 
     def _load_target_asset(self): # smplx
-        asset_root = resolve_data_path("assets", "objects")
+        physics_cache_root = _shared_arctic_physics_cache()
         self._target_asset = []
         points_num = []
         self.object_points = []
         for i, object_name in enumerate(self.object_name):
 
+            asset_root = physics_cache_root / object_name
             asset_file = object_name + ".urdf"
+            if not (asset_root / asset_file).is_file():
+                raise FileNotFoundError(
+                    f"Missing fixed ARCTIC physics asset for {object_name}: {asset_root / asset_file}"
+                )
             obj_file = resolve_data_path("assets", "objects", "objects", object_name, object_name + ".obj")
-            max_convex_hulls = 64
-            density = self.object_density
         
             asset_options = gymapi.AssetOptions()
             asset_options.angular_damping = 0.01
             asset_options.linear_damping = 0.01
-
-            asset_options.density = density
+            asset_options.fix_base_link = False
+            asset_options.disable_gravity = False
+            asset_options.override_com = False
+            asset_options.override_inertia = False
             asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
-            asset_options.vhacd_enabled = True
-            asset_options.vhacd_params.max_convex_hulls = max_convex_hulls
-            asset_options.vhacd_params.max_num_vertices_per_ch = 64
-            asset_options.vhacd_params.resolution = 300000
+            # The cache URDF already references the fixed offline VHACD hulls.
+            asset_options.vhacd_enabled = False
 
 
             self._target_asset.append(self.gym.load_asset(self.sim, str(asset_root), asset_file, asset_options))
@@ -356,14 +368,11 @@ class InterMimic(Humanoid_SMPLX):
 
         props = self.gym.get_actor_rigid_shape_properties(env_ptr, target_handle)
         for p_idx in range(len(props)):
-            props[p_idx].restitution = 0.05
-            props[p_idx].friction = 0.6
-            props[p_idx].rolling_friction = 0.01
-            props[p_idx].torsion_friction = 0.01
-            if self.object_name[env_id % len(self.object_name)] == 'plasticbox' or self.object_name[env_id % len(self.object_name)] == 'trashcan':
-                props[p_idx].rest_offset = 0.015
-            else:
-                props[p_idx].rest_offset = 0.002
+            props[p_idx].restitution = self.cfg["env"]["shapeRestitution"]
+            props[p_idx].friction = self.cfg["env"]["shapeFriction"]
+            props[p_idx].rolling_friction = self.cfg["env"]["shapeRollingFriction"]
+            props[p_idx].torsion_friction = self.cfg["env"]["shapeTorsionFriction"]
+            props[p_idx].rest_offset = self.cfg["env"]["shapeRestOffset"]
         self.gym.set_actor_rigid_shape_properties(env_ptr, target_handle, props)
 
         self._target_handles.append(target_handle)

@@ -308,6 +308,17 @@ class Humanoid_SMPLX(BaseTask):
 
         humanoid_handle = self.gym.create_actor(env_ptr, humanoid_asset, start_pose, "humanoid", col_group, col_filter, segmentation_id)
 
+        # The matched ARCTIC-40 protocol fixes every interacting actor's
+        # contact material, not only the articulated object.
+        shape_props = self.gym.get_actor_rigid_shape_properties(env_ptr, humanoid_handle)
+        for shape in shape_props:
+            shape.friction = self.cfg["env"]["shapeFriction"]
+            shape.restitution = self.cfg["env"]["shapeRestitution"]
+            shape.rolling_friction = self.cfg["env"]["shapeRollingFriction"]
+            shape.torsion_friction = self.cfg["env"]["shapeTorsionFriction"]
+            shape.rest_offset = self.cfg["env"]["shapeRestOffset"]
+        self.gym.set_actor_rigid_shape_properties(env_ptr, humanoid_handle, shape_props)
+
         self.gym.enable_actor_dof_force_sensors(env_ptr, humanoid_handle)
 
         for j in range(self.num_bodies):
