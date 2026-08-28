@@ -891,7 +891,12 @@ class InterMimic(Humanoid_SMPLX):
         reset_ig *= (progress_buf > 1 + start_times)
         contact_reset *= (progress_buf > 1 + start_times)
                 
-        terminated = torch.where(torch.logical_or(reset_ig, contact_reset), torch.ones_like(reset_buf), terminated)
+        if enable_early_termination:
+            terminated = torch.where(
+                torch.logical_or(reset_ig, contact_reset),
+                torch.ones_like(reset_buf),
+                terminated,
+            )
         reset = torch.where(reset.bool(), torch.ones_like(reset_buf), terminated)
 
         return reset, terminated
