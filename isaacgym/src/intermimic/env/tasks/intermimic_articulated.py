@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from isaacgym import gymapi, gymtorch
@@ -365,6 +366,7 @@ class InterMimicArticulated(InterMimic):
         ):
             raise ValueError("articulationContactForceThreshold must be positive finite")
         self._rollout_path = env["commonRolloutOutputPath"]
+        self._rollout_fixed_horizon = bool(env.get("fixedHorizonRollout", False))
         self._rollout_fps = self._reference_fps
         if self._rollout_fps <= 0.0:
             raise ValueError("articulated reference FPS must be positive")
@@ -384,6 +386,11 @@ class InterMimicArticulated(InterMimic):
         self._rollout_written = False
         self._rollout_terminated = None
         self._contact_measurement_cache = None
+        self._rollout_sanity_check = (
+            os.environ.get("INTERMIMIC_ROLLOUT_SANITY_CHECK") == "1"
+        )
+        self._rollout_legacy_frames = []
+        self._rollout_cached_contact_frames = 0
         self._q_reference = None
         self._static_box_handles = []
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
@@ -640,16 +647,18 @@ class InterMimicArticulated(InterMimic):
             self._human_contact_box_valid,
             self._human_contact_local_groups,
         )[0]
-        self._rollout_frames.append(dict(
-            human_root_state=self._humanoid_root_states[0].detach().cpu().numpy(),
-            human_dof_pos=self._dof_pos[0].detach().cpu().numpy(),
-            human_body_state=body_state.detach().cpu().numpy(),
-            object_root_state=self._target_states[0].detach().cpu().numpy(),
-            object_joint_qpos=self._target_dof_pos[0].detach().cpu().numpy(),
-            region_distance_m=distance.detach().cpu().numpy(),
-            hand_force_n=np.zeros(2, dtype=np.float32),
-            region_force_n=np.zeros(link_count, dtype=np.float32),
-        ))
+        self._append_rollout_frame(
+            human_root_state=self._humanoid_root_states[0],
+            human_dof_pos=self._dof_pos[0],
+            human_body_state=body_state,
+            object_root_state=self._target_states[0],
+            object_joint_qpos=self._target_dof_pos[0],
+            region_distance_m=distance,
+            hand_force_n=torch.zeros(2, dtype=torch.float32, device=self.device),
+            region_force_n=torch.zeros(
+                link_count, dtype=torch.float32, device=self.device
+            ),
+        )
         self._rollout_next_frame = 1
 
     def pre_physics_step(self, actions):
@@ -1109,6 +1118,18 @@ class InterMimicArticulated(InterMimic):
                 distance[active_env_ids] = active_distance
                 hand_force[active_env_ids] = active_hand_force
                 link_force[active_env_ids] = active_link_force
+            if self._rollout_path:
+                # The recorder runs immediately after this reward calculation.
+                # Keep the live CUDA tensors so it can reuse exactly these
+                # contact measurements instead of issuing an identical second
+                # geometry query for the same physics frame.
+                self._contact_measurement_cache = (
+                    frames.detach().clone(),
+                    intended,
+                    distance,
+                    hand_force,
+                    link_force,
+                )
 
         hand_reward, hand_error, live_contact = _active_link_contact_reward(
             intended=intended,
@@ -1462,33 +1483,105 @@ class InterMimicArticulated(InterMimic):
         )
         return intended, distance, hand_force, region_force
 
+    def _append_rollout_frame(self, **values):
+        """Stage a formal rollout frame on GPU until the episode is complete.
+
+        The legacy recorder immediately transferred every tensor to NumPy on
+        every simulation step.  The resulting host synchronizations dominate
+        one-environment ARCTIC replay.  Cloning on device preserves the exact
+        frame values while deferring the seven device-to-host transfers to the
+        final NPZ write.
+        """
+
+        if self._rollout_sanity_check:
+            self._rollout_legacy_frames.append(
+                {
+                    name: value.detach().cpu().numpy().copy()
+                    for name, value in values.items()
+                }
+            )
+        self._rollout_frames.append(
+            {name: value.detach().clone() for name, value in values.items()}
+        )
+
+    def _rollout_contact_measurements(self, frame):
+        """Return exact live contact telemetry without recomputing reward work.
+
+        ``compute_cg_reward`` runs in ``super().post_physics_step()`` and,
+        whenever the reference requests contact, has already evaluated
+        ``_measure_contacts`` for env 0.  That value covers every hand and
+        articulated link, so it is exactly the value the old recorder computed
+        again immediately afterwards.  Non-contact reference frames retain the
+        old direct measurement, because their reward cache intentionally uses
+        infinities/zeros instead of live telemetry.
+        """
+
+        cached = self._contact_measurement_cache
+        if cached is not None and bool(self._intended_contact_np[frame].any()):
+            _cached_frame, _intended, distance, hand_force, region_force = cached
+            if self._rollout_sanity_check:
+                direct = self._measure_contacts()
+                for label, cached_value, direct_value in zip(
+                    ("distance", "hand_force", "region_force"),
+                    (distance, hand_force, region_force),
+                    direct,
+                ):
+                    if not torch.equal(cached_value, direct_value):
+                        raise RuntimeError(
+                            "rollout contact cache differs from direct "
+                            f"measurement at frame {frame}: {label}"
+                        )
+                self._rollout_cached_contact_frames += 1
+            return distance, hand_force, region_force
+        return self._measure_contacts()
+
     def post_physics_step(self):
         super().post_physics_step()
         if not self._rollout_path or self._rollout_written:
             return
-        distance, hand_force, region_force = self._measure_contacts()
-        frame = int(self._reference_frame()[0].item())
         if self._rollout_next_frame is None:
             return
-        if frame != self._rollout_next_frame:
-            raise RuntimeError(
-                "InterMimic recorder expected reference frame "
-                f"{self._rollout_next_frame}, got {frame}"
-            )
-        self._rollout_frames.append(dict(
-            human_root_state=self._humanoid_root_states[0].detach().cpu().numpy(),
-            human_dof_pos=self._dof_pos[0].detach().cpu().numpy(),
+        if self._rollout_fixed_horizon:
+            # The formal protocol neither terminates nor resets.  The CPU
+            # counter is therefore the reference frame and avoids a per-step
+            # CUDA-to-host scalar synchronization.
+            frame = self._rollout_next_frame
+            if self._rollout_sanity_check:
+                actual_frame = int(self._reference_frame()[0].item())
+                if actual_frame != frame:
+                    raise RuntimeError(
+                        "fixed-horizon recorder frame mismatch: "
+                        f"expected {frame}, got {actual_frame}"
+                    )
+        else:
+            frame = int(self._reference_frame()[0].item())
+            if frame != self._rollout_next_frame:
+                raise RuntimeError(
+                    "InterMimic recorder expected reference frame "
+                    f"{self._rollout_next_frame}, got {frame}"
+                )
+        distance, hand_force, region_force = self._rollout_contact_measurements(
+            frame
+        )
+        self._append_rollout_frame(
+            human_root_state=self._humanoid_root_states[0],
+            human_dof_pos=self._dof_pos[0],
             human_body_state=self._rigid_body_state.view(
                 self.num_envs, -1, 13
-            )[0, :self.num_bodies].detach().cpu().numpy(),
-            object_root_state=self._target_states[0].detach().cpu().numpy(),
-            object_joint_qpos=self._target_dof_pos[0].detach().cpu().numpy(),
-            region_distance_m=distance[0].detach().cpu().numpy(),
-            hand_force_n=hand_force[0].detach().cpu().numpy(),
-            region_force_n=region_force[0].detach().cpu().numpy(),
-        ))
+            )[0, :self.num_bodies],
+            object_root_state=self._target_states[0],
+            object_joint_qpos=self._target_dof_pos[0],
+            region_distance_m=distance[0],
+            hand_force_n=hand_force[0],
+            region_force_n=region_force[0],
+        )
         self._rollout_next_frame += 1
-        done = bool(self.reset_buf[0].item()) or frame >= self._q_reference.shape[0] - 1
+        done = (
+            frame >= self._q_reference.shape[0] - 1
+            if self._rollout_fixed_horizon
+            else bool(self.reset_buf[0].item())
+            or frame >= self._q_reference.shape[0] - 1
+        )
         if done:
             self._write_common_rollout()
             self._rollout_written = True
@@ -1499,10 +1592,10 @@ class InterMimicArticulated(InterMimic):
         if not 1 <= valid_frames <= total_frames:
             raise RuntimeError("InterMimic rollout frames do not match the reference")
 
-        def states(name):
-            values = np.stack([frame[name] for frame in self._rollout_frames]).astype(
-                np.float32
-            )
+        def stacked(name):
+            values = torch.stack(
+                [frame[name] for frame in self._rollout_frames]
+            ).detach().cpu().numpy().astype(np.float32)
             if valid_frames < total_frames:
                 values = np.concatenate(
                     (
@@ -1516,44 +1609,98 @@ class InterMimicArticulated(InterMimic):
                 )
             return values
 
-        def forces(name):
-            values = np.stack([frame[name] for frame in self._rollout_frames]).astype(
-                np.float32
-            )
+        def states(name):
+            values = stacked(name)
             if valid_frames < total_frames:
-                values = np.concatenate(
-                    (
-                        values,
+                values[valid_frames:] = values[valid_frames - 1]
+            return values
+
+        def forces(name):
+            values = stacked(name)
+            if valid_frames < total_frames:
+                values[valid_frames:] = 0.0
+            return values
+
+        state_names = (
+            "human_root_state",
+            "human_dof_pos",
+            "human_body_state",
+            "object_root_state",
+            "object_joint_qpos",
+            "region_distance_m",
+        )
+        force_names = ("hand_force_n", "region_force_n")
+        state_values = {name: states(name) for name in state_names}
+        force_values = {name: forces(name) for name in force_names}
+        if self._rollout_sanity_check:
+            def legacy_values(name, *, force):
+                values = np.stack(
+                    [frame[name] for frame in self._rollout_legacy_frames]
+                ).astype(np.float32)
+                if valid_frames < total_frames:
+                    tail = (
                         np.zeros(
                             (total_frames - valid_frames, *values.shape[1:]),
                             dtype=np.float32,
-                        ),
-                    ),
-                    axis=0,
-                )
-            return values
+                        )
+                        if force
+                        else np.broadcast_to(
+                            values[-1],
+                            (total_frames - valid_frames, *values.shape[1:]),
+                        )
+                    )
+                    values = np.concatenate((values, tail), axis=0)
+                return values
+
+            for name, values in state_values.items():
+                if not np.array_equal(values, legacy_values(name, force=False)):
+                    raise RuntimeError(
+                        f"GPU-staged rollout differs from legacy output: {name}"
+                    )
+            for name, values in force_values.items():
+                if not np.array_equal(values, legacy_values(name, force=True)):
+                    raise RuntimeError(
+                        f"GPU-staged rollout differs from legacy output: {name}"
+                    )
 
         np.savez_compressed(
             self._rollout_path,
             fps=np.asarray(self._rollout_fps, dtype=np.float32),
             valid_frame_count=np.asarray(valid_frames, dtype=np.int64),
-            human_root_state=states("human_root_state"),
-            human_dof_pos=states("human_dof_pos"),
-            human_body_state=states("human_body_state"),
+            human_root_state=state_values["human_root_state"],
+            human_dof_pos=state_values["human_dof_pos"],
+            human_body_state=state_values["human_body_state"],
             human_body_position_reference=self._rollout_reference_body_position,
             human_body_names=np.asarray(self._common_human_body_names),
             human_dof_names=np.asarray(self._common_human_dof_names),
-            object_root_state=states("object_root_state"),
-            object_joint_qpos=states("object_joint_qpos"),
+            object_root_state=state_values["object_root_state"],
+            object_joint_qpos=state_values["object_joint_qpos"],
             object_joint_qpos_reference=self._q_reference_np.astype(np.float32),
             joint_names=np.asarray(self._joint_names),
             joint_types=np.asarray(self._joint_types),
-            region_distance_m=states("region_distance_m"),
+            region_distance_m=state_values["region_distance_m"],
             intended=np.asarray(self._intended_contact_np, dtype=np.bool_),
-            hand_force_n=forces("hand_force_n"),
-            region_force_n=forces("region_force_n"),
+            hand_force_n=force_values["hand_force_n"],
+            region_force_n=force_values["region_force_n"],
             contact_region_link_names=np.asarray(self._target_contact_link_names),
         )
+        if self._rollout_sanity_check:
+            Path(self._rollout_path).with_name(
+                "rollout_recorder_sanity.json"
+            ).write_text(
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "contact_cache_bitwise_equal": True,
+                        "gpu_staging_bitwise_equal": True,
+                        "cached_contact_frames": self._rollout_cached_contact_frames,
+                        "valid_frame_count": valid_frames,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
 
 __all__ = ["InterMimicArticulated"]
