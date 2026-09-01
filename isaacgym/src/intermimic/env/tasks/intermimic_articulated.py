@@ -245,16 +245,6 @@ class InterMimicArticulated(InterMimic):
         self._active_joint_names = [
             str(value) for value in self._object_config["active_joint_names"]
         ]
-        self._initial_qpos_np = np.asarray(
-            self._object_config["initial_joint_qpos"],
-            dtype=np.float32,
-        ).reshape(-1)
-        if (
-            self._initial_qpos_np.shape != (len(self._joint_names),)
-            or not np.isfinite(self._initial_qpos_np).all()
-        ):
-            raise ValueError("initial_joint_qpos must be finite and match object joints")
-        self._initial_qvel_np = np.zeros_like(self._initial_qpos_np)
         self._object_dof_count = len(self._joint_names)
         self._active_link_names = [
             str(value)
@@ -282,12 +272,15 @@ class InterMimicArticulated(InterMimic):
             raise ValueError("Articulated manifest and reference topology disagree")
         if (
             self._q_reference_np.ndim != 2
+            or not self._q_reference_np.shape[0]
             or self._q_reference_np.shape[1] != self._object_dof_count
         ):
             raise ValueError(
                 "object_joint_qpos must have shape (frames, object DOFs), got "
                 f"{self._q_reference_np.shape} for {self._object_dof_count} DOFs"
             )
+        self._initial_qpos_np = self._q_reference_np[0].copy()
+        self._initial_qvel_np = np.zeros_like(self._initial_qpos_np)
         if self._link_reference_np.shape != (
             self._q_reference_np.shape[0],
             len(self._reference_link_names),
