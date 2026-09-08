@@ -1025,6 +1025,9 @@ class InterMimicArticulated(InterMimic):
             * angular_velocity_reward
             * energy_reward
         )
+        q_error = (self._target_dof_pos - self._q_reference[frames]).square().mean(dim=-1)
+        articulation_reward = torch.exp(-weights.get("oq", 0.0) * q_error)
+        object_reward = object_reward * articulation_reward
         object_reset = (obj_points - ref_obj_points).norm(dim=-1).mean(dim=-1) > 0.5
         self.extras["active_link_position_reward"] = position_reward
         self.extras["active_link_rotation_reward"] = rotation_reward
@@ -1497,35 +1500,16 @@ class InterMimicArticulated(InterMimic):
             {name: value.detach().clone() for name, value in values.items()}
         )
 
-    def _rollout_contact_measurements(self, frame):
-        """Return exact live contact telemetry without recomputing reward work.
+    def _rollout_contact_measurements(self, _frame):
+        """Measure the current physics state for formal rollout telemetry.
 
-        ``compute_cg_reward`` runs in ``super().post_physics_step()`` and,
-        whenever the reference requests contact, has already evaluated
-        ``_measure_contacts`` for env 0.  That value covers every hand and
-        articulated link, so it is exactly the value the old recorder computed
-        again immediately afterwards.  Non-contact reference frames retain the
-        old direct measurement, because their reward cache intentionally uses
-        infinities/zeros instead of live telemetry.
+        Reward evaluation can cache an ``inf`` distance placeholder for a
+        reference-frame/recorder-frame mismatch.  That placeholder is valid
+        for reward masking but is not valid protocol telemetry: the common
+        rollout requires a finite geometry distance at every frame.  Measure
+        directly here, as the pre-GPU-staging recorder did.
         """
 
-        cached = self._contact_measurement_cache
-        if cached is not None and bool(self._intended_contact_np[frame].any()):
-            _cached_frame, _intended, distance, hand_force, region_force = cached
-            if self._rollout_sanity_check:
-                direct = self._measure_contacts()
-                for label, cached_value, direct_value in zip(
-                    ("distance", "hand_force", "region_force"),
-                    (distance, hand_force, region_force),
-                    direct,
-                ):
-                    if not torch.equal(cached_value, direct_value):
-                        raise RuntimeError(
-                            "rollout contact cache differs from direct "
-                            f"measurement at frame {frame}: {label}"
-                        )
-                self._rollout_cached_contact_frames += 1
-            return distance, hand_force, region_force
         return self._measure_contacts()
 
     def post_physics_step(self):
