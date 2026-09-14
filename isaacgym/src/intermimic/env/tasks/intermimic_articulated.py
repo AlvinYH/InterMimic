@@ -145,6 +145,12 @@ class InterMimicArticulated(InterMimic):
         )
 
         env = cfg["env"]
+        for key in ("oq", "oqv"):
+            if key not in env["rewardWeights"]:
+                raise ValueError(f"rewardWeights.{key} is required; use 0 to disable the term")
+            value = env["rewardWeights"][key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
+                raise ValueError(f"rewardWeights.{key} must be finite and non-negative")
         manifest_path = Path(env["articulatedInputPath"]).expanduser().resolve()
         self._object_config = json.loads(manifest_path.read_text(encoding="utf-8"))
         static_collision_filter = self._object_config.get(
@@ -228,6 +234,19 @@ class InterMimicArticulated(InterMimic):
                     values["object_surface_point_link_names"]
                 ).tolist()
             ]
+            # Full-object interaction surface (all links, fixed part included).
+            # The author scored the whole rigid object; the articulated adaptation
+            # must therefore keep the fixed part in the interaction graph instead
+            # of seeing only the moving link.
+            self._full_surface_points_np = np.asarray(
+                values["full_surface_points_link_local_scaled"], dtype=np.float32
+            )
+            self._full_surface_link_names = [
+                str(value)
+                for value in np.asarray(
+                    values["full_surface_point_link_names"]
+                ).tolist()
+            ]
             self._contact_points_np = np.asarray(
                 values["collision_surface_points_link_local_scaled"], dtype=np.float32
             )
@@ -254,6 +273,43 @@ class InterMimicArticulated(InterMimic):
             raise ValueError(
                 "InterMimic's fixed-width 21-D object tracking supports exactly "
                 "one active task link; the shared scene still simulates every joint"
+            )
+        if len(self._active_joint_names) != 1:
+            raise ValueError("Articulated reward currently requires exactly one active joint")
+        self._active_joint_ids = [
+            self._joint_names.index(name) for name in self._active_joint_names
+        ]
+        # Joint-space early termination.  The author ended an episode when the object
+        # drifted from the reference; on a hinged part that criterion can never fire
+        # (the surface points only rotate, so their mean displacement saturates well
+        # below its 0.5 m threshold).  The same intent is expressed here on the added
+        # joint degree of freedom, as a fraction of this case's reference peak |q|.
+        q_termination_fraction = env.get("articulationTerminationFraction", 0.75)
+        if (
+            isinstance(q_termination_fraction, bool)
+            or not isinstance(q_termination_fraction, (int, float))
+            or not np.isfinite(q_termination_fraction)
+            or q_termination_fraction < 0.0
+        ):
+            raise ValueError(
+                "env.articulationTerminationFraction must be finite and non-negative"
+            )
+        self._articulation_termination_fraction = float(q_termination_fraction)
+        self._articulation_peak_rad = float(
+            np.abs(self._q_reference_np[:, self._active_joint_ids]).max()
+        )
+        if (
+            self._articulation_termination_fraction > 0.0
+            and self._articulation_peak_rad <= 0.0
+        ):
+            raise ValueError(
+                "reference has no active-joint motion to bound the joint reset"
+            )
+        active_joint_types = [self._joint_types[index] for index in self._active_joint_ids]
+        if any(joint_type != "revolute" for joint_type in active_joint_types):
+            raise ValueError(
+                "Articulated q/qv reward currently supports only bounded revolute joints; "
+                f"got {active_joint_types}"
             )
         if (
             reference_joint_names != self._joint_names
@@ -332,6 +388,14 @@ class InterMimicArticulated(InterMimic):
             or len(self._object_surface_link_names) != 1024
         ):
             raise ValueError("Object interaction surface must contain exactly 1,024 points")
+
+        if (
+            self._full_surface_points_np.shape != (1024, 3)
+            or len(self._full_surface_link_names) != 1024
+        ):
+            raise ValueError(
+                "Full-object interaction surface must contain exactly 1,024 points"
+            )
         if not np.isfinite(self._object_surface_points_np).all():
             raise ValueError("Object interaction surface must be finite")
         self._configure_articulated_actor = configure_articulated_actor
@@ -892,6 +956,42 @@ class InterMimicArticulated(InterMimic):
             angle.view(-1, 52) * (1.0 - weight_h), dim=-1
         )
         rotation_reward = torch.exp(-rotation_error * weights["r"])
+        rotation_error = torch.mean(
+            angle.view(-1, 52) * (1.0 - weight_h), dim=-1
+        )
+        # Articulation adaptation, disabled at r_active = 0 (then this is exactly the
+        # author formula).  The author exempts bodies that sit on the object in the
+        # reference, (1 - weight_h), from rotation tracking.  That is a rigid-object
+        # assumption: a hand on a rigid object need not be oriented correctly to push
+        # it.  For a hinged object the bodies touching the ACTIVE link are the ones
+        # that transmit the driving torque, so their rotation is tracked as well.
+        _r_active = float(weights.get("r_active", 0.0))
+        _ref_body_pos = self.extract_data_component(
+            "body_pos", obs=self._curr_ref_obs
+        ).view(self.num_envs, -1, 3)
+        _active_points = self._reference_surface_points(
+            self._reference_frame(),
+            self._active_rotation_surface_points,
+            self._active_rotation_reference_link_ids,
+        )
+        weight_active = (
+            -5.0 * compute_sdf(_ref_body_pos, _active_points).norm(dim=-1)
+        ).exp()
+        rotation_error = rotation_error + _r_active * (
+            angle.view(-1, 52) * weight_active
+        ).mean(dim=-1)
+        rotation_reward = torch.exp(-rotation_error * weights["r"])
+        # Only the r_active observables are logged: the applied value, the effective
+        # per-body rotation weight, and the target mask it is built from.
+        _rot_weight = 1.0 - weight_h
+        self.extras["r_active"] = float(_r_active)
+        self.extras["r_active_rot_error"] = rotation_error
+        for _label, _idx in self._rotation_diagnostic_groups.items():
+            if _idx:
+                self.extras["r_active_mask_" + _label] = weight_active[:, _idx].mean(dim=-1)
+                self.extras["r_active_weight_" + _label] = (
+                    _rot_weight[:, _idx] + _r_active * weight_active[:, _idx]
+                ).mean(dim=-1)
 
         body_velocity_error = torch.mean(
             (
@@ -931,6 +1031,9 @@ class InterMimicArticulated(InterMimic):
             * energy_reward
         )
         reset = (ref_key_pos - key_pos).norm(dim=-1).mean(dim=-1) > 0.5
+        self.extras["reward_human"] = reward
+        self.extras["human_position_reward"] = position_reward
+        self.extras["human_rotation_reward"] = rotation_reward
         return reward, reset, key_pos, ref_key_pos
 
     def _compute_reset(self):
@@ -940,6 +1043,54 @@ class InterMimicArticulated(InterMimic):
 
         self._rollout_terminated |= self._terminate_buf.bool()
         self._terminate_buf[:] = self._rollout_terminated.to(self._terminate_buf.dtype)
+
+    def _object_root_tracking_reward(self, weights, frames):
+        """Author rigid-object tracking applied to the object root (fixed part).
+
+        The author tracked the whole rigid object pose.  The articulated reward
+        tracks the moving link instead, which leaves the fixed part unconstrained
+        (a base rotation about the hinge axis is indistinguishable from the joint
+        angle).  This factor restores the author's own object tracking.
+        """
+
+        root_pos = self.extract_data_component("root_pos", obs=self._curr_obs)
+        root_rot = self.extract_data_component("root_rot", obs=self._curr_obs)
+        heading = torch_utils.calc_heading_quat_inv(root_rot)
+        live = self._target_states
+        local_pos = live[:, :3] - root_pos
+        local_pos[..., -1] = live[:, 2]
+        local_pos = torch_utils.quat_rotate(heading, local_pos)
+        local_rot = quat_mul(heading, live[:, 3:7])
+
+        reference_root_pos = self.extract_data_component(
+            "root_pos", obs=self._curr_ref_obs
+        )
+        reference_root_rot = self.extract_data_component(
+            "root_rot", obs=self._curr_ref_obs
+        )
+        reference_heading = torch_utils.calc_heading_quat_inv(reference_root_rot)
+        reference = self._root_reference[frames]
+        reference_local_pos = reference[:, :3] - reference_root_pos
+        reference_local_pos[..., -1] = reference[:, 2]
+        reference_local_pos = torch_utils.quat_rotate(
+            reference_heading, reference_local_pos
+        )
+        reference_local_rot = quat_mul(reference_heading, reference[:, 3:7])
+
+        position_reward = torch.exp(
+            -weights["op"]
+            * torch.mean((reference_local_pos - local_pos) ** 2, dim=-1)
+        )
+        rotation_difference = torch_utils.quat_mul_norm(
+            torch_utils.quat_inverse(reference_local_rot), local_rot
+        )
+        rotation_angle, _ = torch_utils.quat_to_angle_axis(rotation_difference)
+        rotation_reward = torch.exp(-weights["or"] * rotation_angle)
+        velocity_reward = torch.exp(
+            -weights["opv"]
+            * torch.mean((reference[:, 7:10] - live[:, 7:10]) ** 2, dim=-1)
+        )
+        return position_reward * rotation_reward * velocity_reward
 
     def compute_obj_reward(self, weights):
         """Use the author rigid-object reward on the active link instead."""
@@ -1025,14 +1176,51 @@ class InterMimicArticulated(InterMimic):
             * angular_velocity_reward
             * energy_reward
         )
-        q_error = (self._target_dof_pos - self._q_reference[frames]).square().mean(dim=-1)
-        articulation_reward = torch.exp(-weights.get("oq", 0.0) * q_error)
-        object_reward = object_reward * articulation_reward
+        # Keep [env, active joint] axes; exclude inactive object DOFs.
+        object_reward = object_reward * self._object_root_tracking_reward(weights, frames)
+        active_joint_ids = self._active_joint_ids
+        q_delta = (
+            self._target_dof_pos[:, active_joint_ids]
+            - self._q_reference[frames][:, active_joint_ids]
+        )
+        qv_delta = (
+            self._target_dof_vel[:, active_joint_ids]
+            - self._qvel_reference[frames][:, active_joint_ids]
+        )
+        # Bounded hinge coordinates are not wrapped modulo 2*pi.
+        q_error = q_delta.square().mean(dim=-1)
+        qv_error = qv_delta.square().mean(dim=-1)
+        q_reward = torch.exp(-weights["oq"] * q_error)
+        qv_reward = torch.exp(-weights["oqv"] * qv_error)
+        articulated_reward = q_reward * qv_reward
+        object_reward = object_reward * articulated_reward
+        self.extras["active_joint_q_error"] = q_error
+        self.extras["active_joint_qv_error"] = qv_error
+        self.extras["active_joint_q_reward"] = q_reward
+        self.extras["active_joint_qv_reward"] = qv_reward
+        self.extras["articulated_reward"] = articulated_reward
+        self.extras["active_joint_q"] = self._target_dof_pos[:, active_joint_ids].mean(dim=-1)
+        self.extras["active_joint_q_reference"] = self._q_reference[frames][:, active_joint_ids].mean(dim=-1)
+        # Verification of the RSI/PSI fix: where rollouts actually start, and where
+        # the env population sits.  rsi_start_* stays 0 while rolloutLength >= clip
+        # length, because then the RSI sampling range degenerates to a single frame.
+        self.extras["rsi_start_mean"] = self.start_times.float().mean()
+        self.extras["rsi_start_p90"] = torch.quantile(self.start_times.float(), 0.9)
+        self.extras["progress_mean"] = self.progress_buf.float().mean()
+        self.extras["progress_p90"] = torch.quantile(self.progress_buf.float(), 0.9)
         object_reset = (obj_points - ref_obj_points).norm(dim=-1).mean(dim=-1) > 0.5
-        self.extras["active_link_position_reward"] = position_reward
-        self.extras["active_link_rotation_reward"] = rotation_reward
-        self.extras["active_link_velocity_reward"] = velocity_reward
-        self.extras["active_link_angular_velocity_reward"] = angular_velocity_reward
+        # Joint-space divergence, because the surface-point test above cannot fire for
+        # a hinged part: "the object went wrong" must also be checked on the joint.
+        if self._articulation_termination_fraction > 0.0:
+            q_termination_error = (
+                self._target_dof_pos[:, self._active_joint_ids]
+                - self._q_reference[frames][:, self._active_joint_ids]
+            ).abs().amax(dim=-1)
+            object_reset = object_reset | (
+                q_termination_error
+                > self._articulation_termination_fraction * self._articulation_peak_rad
+            )
+        self.extras["reward_object"] = object_reward
         return object_reward, object_reset, obj_points, ref_obj_points
 
     def compute_ig_reward(self, weights, key_pos, ref_key_pos, _obj_points, _ref_obj_points):
@@ -1080,6 +1268,7 @@ class InterMimicArticulated(InterMimic):
             reference_normalized_error.amax(dim=(1, 2)) > 2,
             live_normalized_error.amax(dim=(1, 2)) > 2,
         )
+        self.extras["reward_ig"] = reward
         return reward, reset
 
     def compute_cg_reward(self, weights):
@@ -1164,14 +1353,8 @@ class InterMimicArticulated(InterMimic):
             * prohibited_reward
             * energy_reward
         )
-        self.extras["active_link_contact_reward"] = hand_reward.mean(dim=1)
-        self.extras["active_link_contact_live"] = live_contact.float().mean(dim=1)
         nearest_distance = distance.amin(dim=2)
-        self.extras["active_link_contact_distance_m"] = torch.where(
-            torch.isfinite(nearest_distance),
-            nearest_distance,
-            torch.zeros_like(nearest_distance),
-        ).mean(dim=1)
+        self.extras["reward_cg"] = reward
         return reward, hand_error
 
     def _resolve_rollout_body_indices(self):
@@ -1225,11 +1408,53 @@ class InterMimicArticulated(InterMimic):
             self._graph_surface_points,
             self._graph_body_ids,
             self._graph_reference_link_ids,
-        ) = (
-            self._object_surface_points,
-            self._object_surface_body_ids,
-            self._object_surface_reference_link_ids,
+        ) = surface_tensors(
+            self._full_surface_points_np,
+            self._full_surface_link_names,
+            "full_object",
         )
+        # Articulation adaptation surface pool: the active link only, subsampled so
+        # the per-body distance tensor stays small enough for the 32 GB cards.
+        _full_link_names = [str(name) for name in self._full_surface_link_names]
+        _active_mask = np.asarray(
+            [name == active_link for name in _full_link_names], dtype=bool
+        )
+        _active_points_np = self._full_surface_points_np[_active_mask]
+        if _active_points_np.shape[0] == 0:
+            raise ValueError(
+                f"active link {active_link!r} has no surface points for r_active"
+            )
+        _active_points_np = np.ascontiguousarray(
+            _active_points_np[:: max(1, _active_points_np.shape[0] // 128)]
+        )
+        self._active_rotation_surface_points = torch.as_tensor(
+            _active_points_np, device=self.device, dtype=torch.float32
+        )
+        self._active_rotation_reference_link_ids = torch.full(
+            (_active_points_np.shape[0],),
+            self._active_reference_link_id,
+            device=self.device,
+            dtype=torch.long,
+        )
+        # Body groups reported for the r_active term (diagnostics only).
+        _rot_names = list(self._common_human_body_names)
+
+        def _pick(*keys, side=None):
+            picked = []
+            for index, name in enumerate(_rot_names):
+                if side is not None and not name.startswith(side):
+                    continue
+                if any(key in name for key in keys):
+                    picked.append(index)
+            return picked
+
+        self._rotation_diagnostic_groups = {
+            "L_hand": _pick("Index", "Middle", "Pinky", "Ring", "Thumb", "Wrist", side="L_"),
+            "R_hand": _pick("Index", "Middle", "Pinky", "Ring", "Thumb", "Wrist", side="R_"),
+            "L_wrist": _pick("Wrist", side="L_"),
+            "R_wrist": _pick("Wrist", side="R_"),
+            "legs": _pick("Hip", "Knee", "Ankle", "Toe"),
+        }
 
         human_names = list(self.gym.get_actor_rigid_body_names(self.envs[0], self.humanoid_handles[0]))
         if tuple(human_names) != self._common_human_body_names:

@@ -246,6 +246,25 @@ class InterMimicAgent(common_agent.CommonAgent):
 
                     self.writer.add_scalar('episode_lengths/frame', mean_lengths, self.frame)
                     self.writer.add_scalar('episode_lengths/iter',  mean_lengths, epoch_num)
+                    _task = getattr(getattr(self.vec_env, "env", None), "task", None)
+                    _extras = getattr(_task, "extras", None)
+                    if isinstance(_extras, dict):
+                        for _key, _value in _extras.items():
+                            if torch.is_tensor(_value):
+                                if _value.dtype == torch.bool or _value.numel() == 0:
+                                    continue
+                                try:
+                                    _scalar = float(_value.detach().float().mean())
+                                except Exception:
+                                    continue
+                            else:
+                                try:
+                                    _scalar = float(_value)
+                                except Exception:
+                                    continue
+                            if _scalar != _scalar or _scalar in (float("inf"), float("-inf")):
+                                continue
+                            self.writer.add_scalar("articulated/" + _key, _scalar, epoch_num)
 
                     if self.has_self_play_config:
                         self.self_play_manager.update(self)
