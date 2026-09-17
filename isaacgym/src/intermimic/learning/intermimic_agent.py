@@ -165,8 +165,10 @@ class InterMimicAgent(common_agent.CommonAgent):
         if self.resume_from != 'None':
             try:
                 self.restore(self.resume_from)
-            except:
-                print('Failed to restore from checkpoint')
+            except Exception as exc:
+                raise RuntimeError(
+                    f'Failed to restore from checkpoint: {self.resume_from}'
+                ) from exc
 
         self.init_tensors()
         self.last_mean_rewards = -100500

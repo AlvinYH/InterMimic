@@ -791,6 +791,25 @@ class InterMimic(Humanoid_SMPLX):
                                                                            self._enable_early_termination, self._termination_heights, self.start_times,
                                                                            self.rollout_length, self.kinematic_reset, torch.any(self.contact_reset > 10, dim=-1)
                                                                           )
+        _, humanoid_terminated = self.compute_humanoid_reset(
+            self.reset_buf,
+            self.progress_buf,
+            self.obs_buf,
+            self._rigid_body_pos,
+            self.max_episode_length[self.data_id],
+            self._enable_early_termination,
+            self._termination_heights,
+            self.start_times,
+            self.rollout_length,
+        )
+        after_grace_period = self.progress_buf > 1 + self.start_times
+        self.extras["termination_humanoid_height"] = humanoid_terminated.float()
+        self.extras["termination_human_tracking"] = (self._human_reset & after_grace_period).float()
+        self.extras["termination_interaction_graph"] = (self._ig_reset & after_grace_period).float()
+        self.extras["termination_contact_11_steps"] = (
+            torch.any(self.contact_reset > 10, dim=-1) & after_grace_period
+        ).float()
+        self.extras["termination_total"] = self._terminate_buf.float()
 
         # Evaluation metrics update (assumes stateInit is "Start", so start_times is 0)
         if self.enable_evaluation:
@@ -911,6 +930,9 @@ class InterMimic(Humanoid_SMPLX):
         kinematic_reset = torch.logical_or(human_reset, object_reset)
         self.contact_reset = (self.contact_reset + contact_reset) * contact_reset
         self.kinematic_reset = torch.logical_or(ig_reset, kinematic_reset)
+        self._human_reset = human_reset
+        self._ig_reset = ig_reset
+        self.extras["contact_mismatch_step"] = torch.any(contact_reset > 0, dim=-1).float()
         index = torch.arange(self._curr_reward.shape[0])
         # # print(self._humanoid_root_states.dtype)
         self._curr_reward[index, self.progress_buf - self.start_times] = self.rew_buf

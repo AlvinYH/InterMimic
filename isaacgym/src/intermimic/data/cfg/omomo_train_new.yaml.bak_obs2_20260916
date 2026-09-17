@@ -20,7 +20,7 @@ env:
   dataFramesScale: 1 # 25->30fps
   dataSub: ['sub2']
   ballSize: 1.
-  numObs: 3202  # author 3198 + 4*1: appended articulated joint-state block
+  numObs: 3198
   motion_file: InterAct/OMOMO_new
   robotType: "smplx/omomo.xml"
   localRootObs: False

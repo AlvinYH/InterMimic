@@ -15,6 +15,62 @@ from isaacgym.torch_utils import quat_mul, to_torch
 from ...utils import torch_utils
 
 
+def _active_link_contact_reward(
+    *,
+    intended,
+    distance,
+    hand_force,
+    link_force,
+    distance_threshold,
+    force_threshold,
+    missing_weight,
+):
+    """Reward intended hand contact only when it reaches the active link."""
+
+    if intended.shape != hand_force.shape or intended.ndim != 2:
+        raise ValueError("intended and hand_force must share shape (envs, hands)")
+    if distance.ndim != 3 or distance.shape[:2] != intended.shape:
+        raise ValueError("distance must have shape (envs, hands, active_links)")
+    if link_force.shape != (intended.shape[0], distance.shape[2]):
+        raise ValueError("link_force must have shape (envs, active_links)")
+
+    intended_contact = intended > 0.1
+    near_link = distance <= distance_threshold
+    loaded_hand = hand_force >= force_threshold
+    loaded_link = link_force[:, None, :] >= force_threshold
+    live_contact = loaded_hand & torch.any(near_link & loaded_link, dim=2)
+    nearest_distance = distance.amin(dim=2)
+
+    floor = 0.5 * (
+        1.0
+        + torch.exp(
+            torch.as_tensor(
+                -float(missing_weight),
+                dtype=nearest_distance.dtype,
+                device=nearest_distance.device,
+            )
+        )
+    )
+    proximity = torch.exp(
+        -nearest_distance.clamp_min(0.0) / float(distance_threshold)
+    )
+    proximity = torch.where(
+        torch.isfinite(proximity), proximity, torch.zeros_like(proximity)
+    )
+    score = torch.where(
+        live_contact,
+        torch.ones_like(proximity),
+        0.5 * proximity,
+    )
+    hand_reward = torch.where(
+        intended_contact,
+        floor + (1.0 - floor) * score,
+        torch.ones_like(score),
+    )
+    hand_error = (intended_contact & ~live_contact).to(dtype=distance.dtype)
+    return hand_reward, hand_error, live_contact
+
+
 def _initial_object_reset_state(
     initial_qpos,
     env_ids,
@@ -108,45 +164,85 @@ class InterMimicArticulated(InterMimic):
         ):
             raise ValueError("static_box_collision_filter must be a non-negative integer")
         self._static_collision_filter = static_collision_filter
-        motion_files = sorted(Path(env["motion_file"]).glob("*.pt"))
-        if len(motion_files) != 1:
-            raise ValueError("Articulated InterMimic requires exactly one motion .pt")
-        motion = torch.load(motion_files[0], map_location="cpu", weights_only=False)
-        joint_count = len(self._object_config["joint_names"])
-        link_count = len(self._object_config["body_names"])
-        expected_width = 591 + 13 + 2 * joint_count + 13 * link_count
-        if motion.ndim != 2 or not len(motion) or motion.shape[1] != expected_width:
-            raise ValueError(f"Articulated motion must have shape [T,{expected_width}]")
-        reference = motion[:, 591:].numpy()
-        offset = 13
-        self._root_reference_np = reference[:, :offset]
-        self._q_reference_np = reference[:, offset:offset + joint_count]
-        offset += joint_count
-        self._qvel_reference_np = reference[:, offset:offset + joint_count]
-        offset += joint_count
-        links = reference[:, offset:].reshape(len(motion), link_count, 13)
-        self._link_reference_np = links[:, :, :3]
-        self._link_reference_rot_np = links[:, :, 3:7]
-        self._link_reference_vel_np = links[:, :, 7:10]
-        self._link_reference_ang_vel_np = links[:, :, 10:13]
-        object_root_pos = self._root_reference_np[:, :3]
-        object_root_rot = self._root_reference_np[:, 3:7]
-        self._joint_types = [str(value) for value in self._object_config["joint_types"]]
-        self._reference_link_names = [str(value) for value in self._object_config["body_names"]]
-        self._reference_fps = float(self._object_config["fps"])
-        self._object_surface_mode = str(self._object_config["object_surface"])
-        self._object_surface_points_np = np.asarray(
-            self._object_config["object_surface_points_link_local_scaled"], dtype=np.float32
-        )
-        self._object_surface_link_names = [
-            str(value) for value in self._object_config["object_surface_point_link_names"]
-        ]
-        self._contact_points_np = np.asarray(
-            self._object_config["collision_surface_points_link_local_scaled"], dtype=np.float32
-        )
-        self._contact_point_link_names = [
-            str(value) for value in self._object_config["collision_surface_point_link_names"]
-        ]
+        object_reference_path = Path(
+            self._object_config["reference_path"]
+        ).expanduser().resolve()
+        with np.load(object_reference_path, allow_pickle=False) as values:
+            object_root_pos = np.asarray(values["object_root_pos"], dtype=np.float32)
+            object_root_rot = np.asarray(values["object_root_rot_xyzw"], dtype=np.float32)
+            object_root_vel = np.asarray(
+                values["object_root_vel"], dtype=np.float32
+            )
+            object_root_ang_vel = np.asarray(
+                values["object_root_ang_vel"], dtype=np.float32
+            )
+            self._root_reference_np = np.concatenate(
+                (
+                    object_root_pos,
+                    object_root_rot,
+                    object_root_vel,
+                    object_root_ang_vel,
+                ),
+                axis=1,
+            )
+            self._q_reference_np = np.asarray(values["object_joint_qpos"], dtype=np.float32)
+            self._qvel_reference_np = np.asarray(
+                values["object_joint_qvel"], dtype=np.float32
+            )
+            self._joint_types = [
+                str(value) for value in np.asarray(values["joint_types"]).tolist()
+            ]
+            reference_joint_names = [
+                str(value) for value in np.asarray(values["joint_names"]).tolist()
+            ]
+            reference_active_joint_names = [
+                str(value)
+                for value in np.asarray(values["active_joint_names"]).tolist()
+            ]
+            reference_active_parent_names = [
+                str(value)
+                for value in np.asarray(values["active_parent_link_names"]).tolist()
+            ]
+            reference_active_child_names = [
+                str(value)
+                for value in np.asarray(values["active_child_link_names"]).tolist()
+            ]
+            self._link_reference_np = np.asarray(values["object_link_pos"], dtype=np.float32)
+            self._link_reference_rot_np = np.asarray(
+                values["object_link_rot_xyzw"], dtype=np.float32
+            )
+            self._link_reference_vel_np = np.asarray(
+                values["object_link_vel"], dtype=np.float32
+            )
+            self._link_reference_ang_vel_np = np.asarray(
+                values["object_link_ang_vel"], dtype=np.float32
+            )
+            self._reference_link_names = [
+                str(value) for value in np.asarray(values["body_names"]).tolist()
+            ]
+            self._intended_contact_np = np.asarray(values["intended"], dtype=np.bool_)
+            self._reference_fps = float(np.asarray(values["fps"]).item())
+            self._object_surface_mode = str(
+                np.asarray(values["object_surface_mode"]).item()
+            )
+            self._object_surface_points_np = np.asarray(
+                values["object_surface_points_link_local_scaled"], dtype=np.float32
+            )
+            self._object_surface_link_names = [
+                str(value)
+                for value in np.asarray(
+                    values["object_surface_point_link_names"]
+                ).tolist()
+            ]
+            self._contact_points_np = np.asarray(
+                values["collision_surface_points_link_local_scaled"], dtype=np.float32
+            )
+            self._contact_point_link_names = [
+                str(value)
+                for value in np.asarray(
+                    values["collision_surface_point_link_names"]
+                ).tolist()
+            ]
         self._object_creation_pos_np, self._object_creation_rot_np = _object_creation_pose(
             object_root_pos, object_root_rot
         )
@@ -203,22 +299,28 @@ class InterMimicArticulated(InterMimic):
                 f"got {active_joint_types}"
             )
 
+        # The joint-state block is appended to the TAIL of the observation.  env numObs
+        # is the WIDENED width: it sizes the observation buffer, so the native (author)
+        # width is recovered by subtracting the block.  Declaring the widened width in the
+        # env config, rather than growing numObs here, keeps the pre-flight check in
+        # pipeline/physics/backends/intermimic.py meaningful -- it compares the resume
+        # checkpoint's input layer against env numObs.  This must run before
+        # super().__init__(), which reads numObs into the observation buffer size.
         # Velocity scale for the appended joint-state block.  The original articulated
         # task declared this as the articulationQvelScale env key; that key is only
-        # supplied on the RePHO path, so derive the same magnitude from the case reference
-        # instead.  The angle scale needs no equivalent: it comes from the object's own
-        # DOF limits, captured in _load_target_asset.
-        self._joint_qvel_scale = max(
-            float(np.abs(self._qvel_reference_np[:, self._active_joint_ids]).max()),
-            1.0e-6,
+        # supplied on the RePHO path, so derive the same magnitude from the case
+        # reference instead.  The joint-angle scale needs no equivalent here: it comes
+        # from the object's own DOF limits, see _load_target_asset.
+        self._joint_qvel_scale = float(
+            max(
+                float(
+                    np.abs(
+                        self._qvel_reference_np[:, self._active_joint_ids]
+                    ).max()
+                ),
+                1.0e-6,
+            )
         )
-
-        # The joint-state block is appended to the TAIL of the observation, so env numObs
-        # must already be the WIDENED width: it sizes the observation buffer and the resume
-        # checkpoint's input layer, and pipeline/physics/backends/intermimic.py compares
-        # the two.  The native (author) width is therefore recovered by subtracting the
-        # block rather than grown here.  This must run before super().__init__(), which
-        # reads numObs into the observation buffer size.
         self._articulation_obs_dims = 4 * len(self._active_joint_names)
         self._native_obs_size = int(env["numObs"]) - self._articulation_obs_dims
         if self._native_obs_size <= 0:
@@ -231,6 +333,21 @@ class InterMimicArticulated(InterMimic):
                     self._articulation_obs_dims,
                 )
             )
+        if (
+            reference_joint_names != self._joint_names
+            or self._joint_types
+            != [str(value) for value in self._object_config["joint_types"]]
+            or reference_active_joint_names != self._active_joint_names
+            or reference_active_parent_names
+            != [
+                str(value)
+                for value in self._object_config["active_parent_link_names"]
+            ]
+            or reference_active_child_names != self._active_link_names
+            or self._reference_link_names
+            != [str(value) for value in self._object_config["body_names"]]
+        ):
+            raise ValueError("Articulated manifest and reference topology disagree")
         if (
             self._q_reference_np.ndim != 2
             or not self._q_reference_np.shape[0]
@@ -280,6 +397,8 @@ class InterMimicArticulated(InterMimic):
             or not np.all(np.isfinite(self._qvel_reference_np))
         ):
             raise ValueError("Object qvel reference must match object q reference")
+        if self._intended_contact_np.shape != (self._q_reference_np.shape[0], 2):
+            raise ValueError("intended contact must have shape (frames, 2)")
         if self._contact_points_np.shape != (len(self._contact_point_link_names), 3):
             raise ValueError("Collision-surface points and point-link names disagree")
         if not self._contact_point_link_names:
@@ -366,33 +485,17 @@ class InterMimicArticulated(InterMimic):
         self._link_reference_ang_vel = torch.as_tensor(
             self._link_reference_ang_vel_np, device=self.device
         )
-        reference_frames = torch.arange(
-            self._q_reference_np.shape[0], device=self.device
-        )
-        reference_contact = self.extract_data_component(
-            "contact_human",
-            ref=True,
-            data_id=torch.zeros_like(reference_frames),
-            t=reference_frames,
-        )
-        self._intended_contact = torch.stack(
-            (
-                (reference_contact[:, 17:33] > 0.1).any(dim=1),
-                (reference_contact[:, 36:52] > 0.1).any(dim=1),
-            ),
-            dim=1,
-        )
-        self._intended_contact_np = self._intended_contact.cpu().numpy()
+        self._intended_contact = torch.as_tensor(self._intended_contact_np, device=self.device)
         if self._rollout_path:
             self._rollout_terminated = torch.zeros(
                 self.num_envs, device=self.device, dtype=torch.bool
             )
         self._resolve_rollout_body_indices()
-        self._previous_object_root_vel = torch.zeros(
+        self._previous_active_link_vel = torch.zeros(
             self.num_envs, 3, device=self.device
         )
-        self._previous_object_root_ang_vel = torch.zeros_like(
-            self._previous_object_root_vel
+        self._previous_active_link_ang_vel = torch.zeros_like(
+            self._previous_active_link_vel
         )
         if self._rollout_path:
             if self.num_envs != 1:
@@ -548,9 +651,13 @@ class InterMimicArticulated(InterMimic):
             reset_qvel = self._qvel_reference[frames]
         self._target_dof_pos[env_ids] = reset_qpos
         self._target_dof_vel[env_ids] = reset_qvel
-        if hasattr(self, "_previous_object_root_vel"):
-            self._previous_object_root_vel[env_ids] = self._root_reference[frames, 7:10]
-            self._previous_object_root_ang_vel[env_ids] = self._root_reference[frames, 10:13]
+        if hasattr(self, "_previous_active_link_vel"):
+            self._previous_active_link_vel[env_ids] = self._link_reference_vel[
+                frames, self._active_reference_link_id
+            ]
+            self._previous_active_link_ang_vel[env_ids] = (
+                self._link_reference_ang_vel[frames, self._active_reference_link_id]
+            )
         if self._rollout_terminated is not None:
             self._rollout_terminated[env_ids] = False
 
@@ -702,7 +809,7 @@ class InterMimicArticulated(InterMimic):
     def _joint_state_observation(self, env_ids):
         """Explicit channel for the added joint degree of freedom.
 
-        The 21-D task block tracks the object root, so without this
+        The 21-D task block tracks the object root (the fixed part), so without this
         block the observation would carry the hinge state only implicitly, through how
         the active link's surface points move.  Both the current joint state and the
         reference joint state are provided, at the same two reference horizons (t+1 and
@@ -927,16 +1034,17 @@ class InterMimicArticulated(InterMimic):
         self._terminate_buf[:] = self._rollout_terminated.to(self._terminate_buf.dtype)
 
     def compute_obj_reward(self, weights):
-        """Track the object root and the active joint separately."""
+        """Use the author rigid-object reward on the active link instead."""
 
         self._contact_measurement_cache = None
         frames = self._reference_frame()
-        live = self._target_states
-        reference = self._root_reference[frames]
-        reference_pos = reference[:, :3]
-        reference_rot = reference[:, 3:7]
-        reference_vel = reference[:, 7:10]
-        reference_ang_vel = reference[:, 10:13]
+        live = self._target_body_state[:, self._active_body_id]
+        reference_pos = self._link_reference[frames, self._active_reference_link_id]
+        reference_rot = self._link_reference_rot[frames, self._active_reference_link_id]
+        reference_vel = self._link_reference_vel[frames, self._active_reference_link_id]
+        reference_ang_vel = self._link_reference_ang_vel[
+            frames, self._active_reference_link_id
+        ]
 
         root_pos = self.extract_data_component("root_pos", obs=self._curr_obs)
         root_rot = self.extract_data_component("root_rot", obs=self._curr_obs)
@@ -979,18 +1087,18 @@ class InterMimicArticulated(InterMimic):
 
         moving = (self.progress_buf - self.start_times > 2).float()
         linear_acceleration = (
-            (live[:, 7:10] - self._previous_object_root_vel) * self.fps_data
+            (live[:, 7:10] - self._previous_active_link_vel) * self.fps_data
         ) * moving.unsqueeze(-1)
         angular_acceleration = (
-            (live[:, 10:13] - self._previous_object_root_ang_vel) * self.fps_data
+            (live[:, 10:13] - self._previous_active_link_ang_vel) * self.fps_data
         ) * moving.unsqueeze(-1)
         energy_reward = torch.exp(
             -weights["eg2"] * torch.mean(linear_acceleration.square(), dim=-1)
         ) * torch.exp(
             -weights["eg2"] * torch.mean(angular_acceleration.square(), dim=-1)
         )
-        self._previous_object_root_vel.copy_(live[:, 7:10])
-        self._previous_object_root_ang_vel.copy_(live[:, 10:13])
+        self._previous_active_link_vel.copy_(live[:, 7:10])
+        self._previous_active_link_ang_vel.copy_(live[:, 10:13])
 
         obj_points = self._surface_points(
             self._target_body_state,
@@ -1048,8 +1156,7 @@ class InterMimicArticulated(InterMimic):
         self.extras["rsi_start_p90"] = torch.quantile(self.start_times.float(), 0.9)
         self.extras["progress_mean"] = self.progress_buf.float().mean()
         self.extras["progress_p90"] = torch.quantile(self.progress_buf.float(), 0.9)
-        surface_reset = (obj_points - ref_obj_points).norm(dim=-1).mean(dim=-1) > 0.5
-        joint_reset = torch.zeros_like(surface_reset)
+        object_reset = (obj_points - ref_obj_points).norm(dim=-1).mean(dim=-1) > 0.5
         # Joint-space divergence, because the surface-point test above cannot fire for
         # a hinged part: "the object went wrong" must also be checked on the joint.
         if self._articulation_termination_fraction > 0.0:
@@ -1057,12 +1164,10 @@ class InterMimicArticulated(InterMimic):
                 self._target_dof_pos[:, self._active_joint_ids]
                 - self._q_reference[frames][:, self._active_joint_ids]
             ).abs().amax(dim=-1)
-            joint_reset = q_termination_error > (
-                self._articulation_termination_fraction * self._articulation_peak_rad
+            object_reset = object_reset | (
+                q_termination_error
+                > self._articulation_termination_fraction * self._articulation_peak_rad
             )
-        object_reset = surface_reset | joint_reset
-        self.extras["termination_object_surface"] = surface_reset.float()
-        self.extras["termination_active_joint"] = joint_reset.float()
         self.extras["reward_object"] = object_reward
         return object_reward, object_reset, obj_points, ref_obj_points
 
@@ -1118,25 +1223,12 @@ class InterMimicArticulated(InterMimic):
         """Adapt the author contact graph to the active articulated link."""
 
         contact_threshold = 0.1
-        ref_human_contact = self.extract_data_component(
-            "contact_human", obs=self._curr_ref_obs
-        )
-        human_contact = self.extract_data_component(
-            "contact_human", obs=self._curr_obs
-        )
-        ref_hands = torch.stack(
-            tuple(
-                ref_human_contact[:, group]
-                for group in self._human_contact_body_groups
-            ),
-            dim=1,
-        )
-        intended = (ref_hands > contact_threshold).any(dim=2).float()
         frames = self._reference_frame()
         cached = getattr(self, "_contact_measurement_cache", None)
         if cached is not None and torch.equal(cached[0], frames):
-            _, _, distance, hand_force, link_force, body_distance = cached
+            _, intended, distance, hand_force, link_force = cached
         else:
+            intended = (self._intended_contact[frames] > contact_threshold).float()
             link_count = len(self._target_contact_link_names)
             distance = torch.full(
                 (self.num_envs, intended.shape[1], link_count),
@@ -1148,55 +1240,45 @@ class InterMimicArticulated(InterMimic):
                 (self.num_envs, link_count),
                 device=self.device,
             )
-            body_distance = torch.full(
-                (self.num_envs, len(self._human_contact_body_ids), link_count),
-                float("inf"),
-                device=self.device,
-            )
             active_env_ids = torch.nonzero(
                 torch.any(intended > contact_threshold, dim=1),
                 as_tuple=False,
             ).reshape(-1)
             if active_env_ids.numel() > 0:
-                active_distance, active_hand_force, active_link_force, active_body_distance = (
+                active_distance, active_hand_force, active_link_force = (
                     self._measure_contacts(active_env_ids)
                 )
                 distance[active_env_ids] = active_distance
                 hand_force[active_env_ids] = active_hand_force
                 link_force[active_env_ids] = active_link_force
-                body_distance[active_env_ids] = active_body_distance
             if self._rollout_path:
+                # The recorder runs immediately after this reward calculation.
+                # Keep the live CUDA tensors so it can reuse exactly these
+                # contact measurements instead of issuing an identical second
+                # geometry query for the same physics frame.
                 self._contact_measurement_cache = (
                     frames.detach().clone(),
                     intended,
                     distance,
                     hand_force,
                     link_force,
-                    body_distance,
                 )
 
-        near_loaded_link = (
-            body_distance <= self._target_contact_distance_threshold
-        ) & (
-            link_force[:, None, :] >= self._target_contact_force_threshold
+        hand_reward, hand_error, live_contact = _active_link_contact_reward(
+            intended=intended,
+            distance=distance,
+            hand_force=hand_force,
+            link_force=link_force,
+            distance_threshold=self._target_contact_distance_threshold,
+            force_threshold=self._target_contact_force_threshold,
+            missing_weight=weights["cg_hand"],
         )
-        active_body_contact = human_contact[:, self._human_contact_body_ids] * (
-            near_loaded_link.any(dim=2).float()
+        human_contact = self.extract_data_component(
+            "contact_human", obs=self._curr_obs
         )
-        active_hands = torch.stack(
-            tuple(active_body_contact[:, group] for group in self._human_contact_group_slices),
-            dim=1,
-        )
-        hand_error_mean = (
-            (active_hands - intended[:, :, None]).abs() * intended[:, :, None]
-        ).mean(dim=2)
-        hand_reward = (
-            0.5 * (1 + torch.exp(-hand_error_mean * weights["cg_hand"])) * intended
-            + (1 - intended)
-        )
-        hand_error = intended * (~(active_hands > contact_threshold).any(dim=2)).float()
-
-        ref_other_contact = ref_human_contact[:, self._human_other_contact_body_ids]
+        ref_other_contact = self.extract_data_component(
+            "contact_human", obs=self._curr_ref_obs
+        )[:, self._human_other_contact_body_ids]
         other_contact = human_contact[:, self._human_other_contact_body_ids]
         other_error = (
             torch.abs(other_contact - ref_other_contact)
@@ -1204,10 +1286,10 @@ class InterMimicArticulated(InterMimic):
         ).mean(dim=1)
         other_reward = torch.exp(-other_error * weights["cg_other"])
 
-        no_contact = torch.abs(human_contact) < contact_threshold
+        no_contact = torch.abs(other_contact) < contact_threshold
         prohibited_error = (
-            torch.abs(no_contact + ref_human_contact)
-            * (ref_human_contact < -contact_threshold)
+            torch.abs(no_contact + ref_other_contact)
+            * (ref_other_contact < -contact_threshold)
         ).mean(dim=1)
         prohibited_reward = torch.exp(-prohibited_error * weights["cg_all"])
 
@@ -1219,6 +1301,7 @@ class InterMimicArticulated(InterMimic):
             * prohibited_reward
             * energy_reward
         )
+        nearest_distance = distance.amin(dim=2)
         self.extras["reward_cg"] = reward
         return reward, hand_error
 
@@ -1414,8 +1497,8 @@ class InterMimicArticulated(InterMimic):
             env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         env_count = int(env_ids.numel())
         link_count = len(self._target_contact_link_names)
-        body_distance = torch.full(
-            (env_count, len(self._human_contact_body_ids), link_count),
+        distance = torch.full(
+            (env_count, 2, link_count),
             float("inf"),
             device=self.device,
         )
@@ -1439,7 +1522,7 @@ class InterMimicArticulated(InterMimic):
                     :,
                     self._contact_point_link_ids == link_index,
                 ]
-                link_body_distance = torch.full(
+                body_distance = torch.full(
                     (env_count, human_state.shape[1]),
                     float("inf"),
                     device=self.device,
@@ -1465,19 +1548,16 @@ class InterMimicArticulated(InterMimic):
                         valid=self._human_contact_box_valid,
                         region_points=point_chunk,
                     )
-                    link_body_distance = torch.minimum(
-                        link_body_distance,
+                    body_distance = torch.minimum(
+                        body_distance,
                         torch.minimum(capsule_distance, box_distance),
                     )
-                body_distance[:, :, link_index] = link_body_distance
-
-        distance = torch.stack(
-            tuple(
-                body_distance[:, group].amin(dim=1)
-                for group in self._human_contact_group_slices
-            ),
-            dim=1,
-        )
+                for label, group in enumerate(
+                    self._human_contact_group_slices
+                ):
+                    distance[:, label, link_index] = body_distance[
+                        :, group
+                    ].min(dim=1).values
 
         hand_force = torch.stack(
             tuple(
@@ -1495,7 +1575,7 @@ class InterMimicArticulated(InterMimic):
             ],
             dim=-1,
         )
-        return distance, hand_force, region_force, body_distance
+        return distance, hand_force, region_force
 
     def _measure_reference_contacts(self, frames):
         intended = (self._intended_contact[frames] > 0.1).float()
@@ -1510,30 +1590,23 @@ class InterMimicArticulated(InterMimic):
             (self.num_envs, link_count),
             device=self.device,
         )
-        body_distance = torch.full(
-            (self.num_envs, len(self._human_contact_body_ids), link_count),
-            float("inf"),
-            device=self.device,
-        )
         active_env_ids = torch.nonzero(
             torch.any(intended > 0.1, dim=1),
             as_tuple=False,
         ).reshape(-1)
         if active_env_ids.numel() > 0:
-            active_distance, active_hand_force, active_region_force, active_body_distance = (
+            active_distance, active_hand_force, active_region_force = (
                 self._measure_contacts(active_env_ids)
             )
             distance[active_env_ids] = active_distance
             hand_force[active_env_ids] = active_hand_force
             region_force[active_env_ids] = active_region_force
-            body_distance[active_env_ids] = active_body_distance
         self._contact_measurement_cache = (
             frames.detach().clone(),
             intended,
             distance,
             hand_force,
             region_force,
-            body_distance,
         )
         return intended, distance, hand_force, region_force
 
@@ -1568,7 +1641,7 @@ class InterMimicArticulated(InterMimic):
         directly here, as the pre-GPU-staging recorder did.
         """
 
-        return self._measure_contacts()[:3]
+        return self._measure_contacts()
 
     def post_physics_step(self):
         super().post_physics_step()
