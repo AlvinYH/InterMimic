@@ -197,16 +197,17 @@ class InterMimicArticulated(InterMimic):
                 "reference has no active-joint motion to bound the joint reset"
             )
         active_joint_types = [self._joint_types[index] for index in self._active_joint_ids]
-        if any(joint_type != "revolute" for joint_type in active_joint_types):
+        supported_joint_types = {"revolute", "prismatic"}
+        if any(joint_type not in supported_joint_types for joint_type in active_joint_types):
             raise ValueError(
-                "Articulated q/qv reward currently supports only bounded revolute joints; "
-                f"got {active_joint_types}"
+                "Articulated q/qv reward supports only bounded revolute or prismatic "
+                f"joints; got {active_joint_types}"
             )
 
         # Velocity scale for the appended joint-state block.  The original articulated
         # task declared this as the articulationQvelScale env key; that key is only
         # supplied on the RePHO path, so derive the same magnitude from the case reference
-        # instead.  The angle scale needs no equivalent: it comes from the object's own
+        # instead.  The position scale needs no equivalent: it comes from the object's own
         # DOF limits, captured in _load_target_asset.
         self._joint_qvel_scale = max(
             float(np.abs(self._qvel_reference_np[:, self._active_joint_ids]).max()),
@@ -1019,7 +1020,7 @@ class InterMimicArticulated(InterMimic):
             self._target_dof_vel[:, active_joint_ids]
             - self._qvel_reference[frames][:, active_joint_ids]
         )
-        # Bounded hinge coordinates are not wrapped modulo 2*pi.
+        # Bounded joint coordinates are not wrapped modulo 2*pi.
         q_error = q_delta.square().mean(dim=-1)
         qv_error = qv_delta.square().mean(dim=-1)
         q_reward = torch.exp(-weights["oq"] * q_error)
