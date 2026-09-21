@@ -11,7 +11,9 @@ import numpy as np
 import torch
 
 from .intermimic import InterMimic, compute_sdf
+from .humanoid import Humanoid_SMPLX
 from isaacgym.torch_utils import quat_mul, to_torch
+from ...utils.path_utils import resolve_repo_path
 from ...utils import torch_utils
 
 
@@ -455,6 +457,93 @@ class InterMimicArticulated(InterMimic):
             self._object_surface_points_np[None],
             device=self.device,
         )
+
+    def _create_envs(self, num_envs, spacing, num_per_row):
+        """Keep the articulated object out of the humanoid aggregate.
+
+        PhysX aborts while duplicating some multi-link collision assets inside an
+        aggregate.  Aggregate membership only changes broadphase construction;
+        the object actor, its shapes, joints, and collision filters are unchanged.
+        """
+
+        lower = gymapi.Vec3(-spacing, -spacing, 0.0)
+        upper = gymapi.Vec3(spacing, spacing, spacing)
+        self._target_handles = []
+        self._load_target_asset()
+
+        asset_path = resolve_repo_path(
+            os.path.join(self.cfg["env"]["asset"]["assetRoot"], self.robot_type)
+        )
+        humanoid_options = gymapi.AssetOptions()
+        humanoid_options.angular_damping = 0.01
+        humanoid_options.max_angular_velocity = 100.0
+        humanoid_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
+        humanoid_asset = self.gym.load_asset(
+            self.sim,
+            str(asset_path.parent),
+            asset_path.name,
+            humanoid_options,
+        )
+
+        self.num_humanoid_bodies = self.gym.get_asset_rigid_body_count(humanoid_asset)
+        self.num_humanoid_shapes = self.gym.get_asset_rigid_shape_count(humanoid_asset)
+        sensor_pose = gymapi.Transform()
+        for body_name in ("right_foot", "left_foot"):
+            body_index = self.gym.find_asset_rigid_body_index(humanoid_asset, body_name)
+            self.gym.create_asset_force_sensor(humanoid_asset, body_index, sensor_pose)
+        actuator_props = self.gym.get_asset_actuator_properties(humanoid_asset)
+        motor_efforts = [prop.motor_effort for prop in actuator_props]
+        self.max_motor_effort = max(motor_efforts)
+        self.motor_efforts = to_torch(motor_efforts, device=self.device)
+        self.torso_index = 0
+        self.num_bodies = self.gym.get_asset_rigid_body_count(humanoid_asset)
+        self.num_dof = self.gym.get_asset_dof_count(humanoid_asset)
+        self.num_joints = self.gym.get_asset_joint_count(humanoid_asset)
+        self.humanoid_handles = []
+        self.envs = []
+        self.dof_limits_lower = []
+        self.dof_limits_upper = []
+
+        for env_id in range(self.num_envs):
+            env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
+            self.gym.begin_aggregate(
+                env_ptr,
+                self.num_humanoid_bodies,
+                self.num_humanoid_shapes,
+                True,
+            )
+            Humanoid_SMPLX._build_env(self, env_id, env_ptr, humanoid_asset)
+            self.gym.end_aggregate(env_ptr)
+            self._build_target(env_id, env_ptr)
+            self._validate_humanoid_object_collision_filters(
+                self.gym,
+                env_ptr,
+                self.humanoid_handles[env_id],
+            )
+            handles = self._create_static_box_actors(
+                self.gym,
+                env_ptr,
+                env_id,
+                self._static_box_assets,
+                self._object_config,
+                collision_filter=self._static_collision_filter,
+            )
+            if env_id == 0:
+                self._static_box_handles = handles
+            self.envs.append(env_ptr)
+
+        dof_properties = self.gym.get_actor_dof_properties(
+            self.envs[0], self.humanoid_handles[0]
+        )
+        for index in range(self.num_dof):
+            lower_limit = dof_properties["lower"][index]
+            upper_limit = dof_properties["upper"][index]
+            self.dof_limits_lower.append(min(lower_limit, upper_limit))
+            self.dof_limits_upper.append(max(lower_limit, upper_limit))
+        self.dof_limits_lower = to_torch(self.dof_limits_lower, device=self.device)
+        self.dof_limits_upper = to_torch(self.dof_limits_upper, device=self.device)
+        if self._pd_control:
+            self._build_pd_action_offset_scale()
 
     def _create_ground_plane(self):
         self._add_ground_plane(self.gym, self.sim, self._object_config)
