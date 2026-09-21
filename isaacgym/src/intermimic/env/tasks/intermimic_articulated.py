@@ -1876,12 +1876,15 @@ class InterMimicArticulated(InterMimic):
             human_body_names=np.asarray(self._common_human_body_names),
             human_dof_names=np.asarray(self._common_human_dof_names),
             object_root_state=state_values["object_root_state"],
+            object_root_state_reference=self._root_reference_np[
+                :, :7
+            ].astype(np.float32),
             object_joint_qpos=state_values["object_joint_qpos"],
             object_joint_qpos_reference=self._q_reference_np.astype(np.float32),
             joint_names=np.asarray(self._joint_names),
             joint_types=np.asarray(self._joint_types),
             region_distance_m=state_values["region_distance_m"],
-            intended=np.asarray(self._intended_contact_np, dtype=np.bool_),
+            contact_ref_by_hand=np.asarray(self._intended_contact_np, dtype=np.bool_),
             hand_force_n=force_values["hand_force_n"],
             region_force_n=force_values["region_force_n"],
             contact_region_link_names=np.asarray(self._target_contact_link_names),
