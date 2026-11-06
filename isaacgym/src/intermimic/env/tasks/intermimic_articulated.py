@@ -1701,8 +1701,12 @@ class InterMimicArticulated(InterMimic):
             region_force_n=region_force[0],
         )
         self._rollout_next_frame += 1
+        # Fixed-horizon rollouts also write on the termination step: a fall
+        # resets the reference playback, so waiting for the horizon would
+        # desync the recorder and lose the genuine pre-fall rollout.
         done = (
             frame >= self._q_reference.shape[0] - 1
+            or bool(self.reset_buf[0].item())
             if self._rollout_fixed_horizon
             else bool(self.reset_buf[0].item())
             or frame >= self._q_reference.shape[0] - 1
