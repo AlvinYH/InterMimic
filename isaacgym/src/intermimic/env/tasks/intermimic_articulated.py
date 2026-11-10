@@ -322,6 +322,7 @@ class InterMimicArticulated(InterMimic):
         ):
             raise ValueError("articulationContactForceThreshold must be positive finite")
         self._rollout_path = env["commonRolloutOutputPath"]
+        self._rollout_region_path = env["commonRolloutContactRegionPath"] if "commonRolloutContactRegionPath" in env else None
         self._rollout_fixed_horizon = bool(env.get("fixedHorizonRollout", False))
         self._rollout_fps = self._reference_fps
         if self._rollout_fps <= 0.0:
@@ -718,6 +719,14 @@ class InterMimicArticulated(InterMimic):
             self._human_contact_box_valid,
             self._human_contact_local_groups,
         )[0]
+        if self._rollout_region is not None:
+            from pipeline.physics.rollout_contact import reference_region_distances
+
+            distance = reference_region_distances(
+                self._rollout_region, body_state[None], self._link_reference[frame],
+                self._link_reference_rot[frame], self._reference_link_names,
+            )[0]
+            link_count = len(self._rollout_region["names"])
         self._append_rollout_frame(
             human_root_state=self._humanoid_root_states[0],
             human_dof_pos=self._dof_pos[0],
@@ -1498,6 +1507,17 @@ class InterMimicArticulated(InterMimic):
             device=self.device,
             dtype=torch.long,
         )
+        self._rollout_region = None
+        if self._rollout_region_path:
+            from pipeline.physics.rollout_contact import prepare_rollout_contact
+
+            self._rollout_region = prepare_rollout_contact({
+                "region_path": self._rollout_region_path,
+                "object_body_names": self._target_asset_body_names,
+                "human_body_names": self._common_human_body_names,
+                "humanoid_xml": self.cfg["env"]["articulatedHumanoidXmlPath"],
+                "device": self.device,
+            })
 
     def _measure_contacts(self, env_ids=None):
         if env_ids is None:
@@ -1658,7 +1678,15 @@ class InterMimicArticulated(InterMimic):
         directly here, as the pre-GPU-staging recorder did.
         """
 
-        return self._measure_contacts()[:3]
+        if self._rollout_region is None:
+            return self._measure_contacts()[:3]
+        from pipeline.physics.rollout_contact import measure_rollout_contact
+
+        return measure_rollout_contact(
+            self._rollout_region,
+            self._rigid_body_state.view(self.num_envs, -1, 13)[:, :self.num_bodies],
+            self._contact_forces, self._target_body_state, self._target_contact_forces,
+        )
 
     def post_physics_step(self):
         super().post_physics_step()
@@ -1814,7 +1842,9 @@ class InterMimicArticulated(InterMimic):
             contact_ref_by_hand=np.asarray(self._intended_contact_np, dtype=np.bool_),
             hand_force_n=force_values["hand_force_n"],
             region_force_n=force_values["region_force_n"],
-            contact_region_link_names=np.asarray(self._target_contact_link_names),
+            contact_region_link_names=np.asarray(
+                self._target_contact_link_names if self._rollout_region is None else self._rollout_region["names"]
+            ),
         )
         if self._rollout_sanity_check:
             Path(self._rollout_path).with_name(
