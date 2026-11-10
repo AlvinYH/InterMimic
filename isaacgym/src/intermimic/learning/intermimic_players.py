@@ -49,6 +49,10 @@ class InterMimicPlayerContinuous(common_player.CommonPlayer):
         sum_steps = 0
         sum_game_res = 0
         n_games = n_games * n_game_life * 10
+        env_config = self.env.task.cfg["env"]
+        if "commonRolloutOutputPath" in env_config and env_config["commonRolloutOutputPath"]:
+            # Studio records one deterministic reference-horizon episode.
+            n_games = 1
         games_played = 0
         has_masks = False
         has_masks_func = getattr(self.env, "has_action_mask", None) is not None
