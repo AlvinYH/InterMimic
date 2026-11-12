@@ -211,13 +211,6 @@ class InterMimicArticulated(InterMimic):
                 self._case_starts_np, self._case_lengths_np, active_ids
             )
         ])
-        if (
-            self._articulation_termination_fraction > 0.0
-            and np.any(self._case_articulation_peaks_np <= 0.0)
-        ):
-            raise ValueError(
-                "reference has no active-joint motion to bound the joint reset"
-            )
         active_joint_types = [self._joint_types[index] for index in self._active_joint_ids]
         supported_joint_types = {"revolute", "prismatic"}
         if any(joint_type not in supported_joint_types for joint_type in active_joint_types):
@@ -494,12 +487,7 @@ class InterMimicArticulated(InterMimic):
         self.object_points = torch.as_tensor(np.asarray(points), device=self.device, dtype=torch.float32)
 
     def _create_envs(self, num_envs, spacing, num_per_row):
-        """Keep the articulated object out of the humanoid aggregate.
-
-        PhysX aborts while duplicating some multi-link collision assets inside an
-        aggregate.  Aggregate membership only changes broadphase construction;
-        the object actor, its shapes, joints, and collision filters are unchanged.
-        """
+        """Create each humanoid and its articulated object in one aggregate."""
 
         lower = gymapi.Vec3(-spacing, -spacing, 0.0)
         upper = gymapi.Vec3(spacing, spacing, spacing)
@@ -543,18 +531,21 @@ class InterMimicArticulated(InterMimic):
             env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
             self.gym.begin_aggregate(
                 env_ptr,
-                self.num_humanoid_bodies,
-                self.num_humanoid_shapes,
+                self.num_humanoid_bodies + self.target_aggregate_body_capacity,
+                1 << (self.num_humanoid_shapes + self.target_aggregate_shape_capacity - 1).bit_length(),
                 True,
             )
             Humanoid_SMPLX._build_env(self, env_id, env_ptr, humanoid_assets[env_id % len(humanoid_assets)])
-            self.gym.end_aggregate(env_ptr)
+            from pipeline.physics.humanoid import apply_humanoid_effort_limits
+
+            if "matchingEvalEffortLimitsNm" in self.cfg["env"]:
+                if not self._pd_control:
+                    raise ValueError("Common evaluation effort limits require position PD control")
+                apply_humanoid_effort_limits(
+                    self.gym, env_ptr, self.humanoid_handles[env_id],
+                    self.cfg["env"]["matchingEvalEffortLimitsNm"],
+                )
             self._build_target(env_id, env_ptr)
-            self._validate_humanoid_object_collision_filters(
-                self.gym,
-                env_ptr,
-                self.humanoid_handles[env_id],
-            )
             handles = self._create_static_box_actors(
                 self.gym,
                 env_ptr,
@@ -562,6 +553,12 @@ class InterMimicArticulated(InterMimic):
                 self._case_static_assets[env_id % len(self._case_inputs)],
                 self._case_configs[env_id % len(self._case_inputs)],
                 collision_filter=self._static_collision_filter,
+            )
+            self.gym.end_aggregate(env_ptr)
+            self._validate_humanoid_object_collision_filters(
+                self.gym,
+                env_ptr,
+                self.humanoid_handles[env_id],
             )
             if env_id == 0:
                 self._static_box_handles = handles
@@ -621,6 +618,15 @@ class InterMimicArticulated(InterMimic):
 
     def _build_env(self, env_id, env_ptr, humanoid_asset):
         super()._build_env(env_id, env_ptr, humanoid_asset)
+        from pipeline.physics.humanoid import apply_humanoid_effort_limits
+
+        if "matchingEvalEffortLimitsNm" in self.cfg["env"]:
+            if not self._pd_control:
+                raise ValueError("Common evaluation effort limits require position PD control")
+            apply_humanoid_effort_limits(
+                self.gym, env_ptr, self.humanoid_handles[env_id],
+                self.cfg["env"]["matchingEvalEffortLimitsNm"],
+            )
         self._validate_humanoid_object_collision_filters(
             self.gym,
             env_ptr,
@@ -1206,8 +1212,10 @@ class InterMimicArticulated(InterMimic):
                 self._active_joint_values(self._target_dof_pos)
                 - self._active_joint_values(self._q_reference[frames])
             ).abs().amax(dim=-1)
-            joint_reset = q_termination_error > (
-                self._articulation_termination_fraction * self._articulation_peak_rad
+            joint_reset = (self._articulation_peak_rad > 0.0) & (
+                q_termination_error > (
+                    self._articulation_termination_fraction * self._articulation_peak_rad
+                )
             )
         object_reset = surface_reset | joint_reset
         self.extras["termination_object_surface"] = surface_reset.float()

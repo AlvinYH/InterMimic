@@ -512,4 +512,5 @@ class Humanoid_SMPLX(BaseTask):
         reset = torch.where(torch.logical_or(progress_buf >= max_episode_length-1, progress_buf - start_times >= rollout_length-1), torch.ones_like(reset_buf), terminated)
         if not enable_early_termination:
             terminated = torch.where(invalid_batches, torch.ones_like(reset_buf), terminated)
+            reset = torch.where(torch.logical_or(progress_buf >= max_episode_length-1, progress_buf - start_times >= rollout_length-1), torch.ones_like(reset_buf), terminated)
         return reset, terminated
