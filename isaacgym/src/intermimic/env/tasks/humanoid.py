@@ -506,6 +506,11 @@ class Humanoid_SMPLX(BaseTask):
         invalid_batches = torch.any(invalid_obs, dim=1)  # Check if any invalid number in each batch (B, N)
         if torch.any(invalid_obs):
             print("invalid observation indices [environment, feature]:", torch.nonzero(invalid_obs)[:32].tolist(), flush=True)
+            bad_ids = torch.nonzero(invalid_batches, as_tuple=False).flatten()
+            for name in ("data_id", "progress_buf", "_humanoid_root_states", "_rigid_body_pos", "_rigid_body_rot", "_dof_pos", "_target_states", "_target_dof_pos"):
+                value = getattr(self, name)
+                selected = value[bad_ids]
+                print(f"invalid observation {name}: shape={tuple(selected.shape)} finite={torch.isfinite(selected).all().item()} sample={selected.reshape(len(bad_ids), -1)[:, :13].tolist()}", flush=True)
             raise Exception("invalid observation")
             
         terminated = torch.where(torch.logical_or(invalid_batches, has_failed), torch.ones_like(reset_buf), terminated)
